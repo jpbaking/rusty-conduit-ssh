@@ -97,7 +97,11 @@ impl CertCache {
     }
 
     /// Number of stored entries (expired entries not yet reaped included).
+    ///
+    /// Synchronizes with `insert_lock` so a concurrent eviction-plus-insert across different
+    /// `DashMap` shards cannot produce a torn count exceeding `max_entries`.
     pub fn len(&self) -> usize {
+        let _guard = self.insert_lock.lock().unwrap_or_else(|e| e.into_inner());
         self.entries.len()
     }
 
