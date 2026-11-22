@@ -1,0 +1,139 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+
+  build:
+    name: Build (${{ matrix.pkg }})
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - pkg: linux-amd64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            ext: ""
+            archive: tar.gz
+          - pkg: linux-arm64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            ext: ""
+            archive: tar.gz
+          - pkg: macos-amd64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            ext: ""
+            archive: tar.gz
+          - pkg: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            ext: ""
+            archive: tar.gz
+          - pkg: windows-amd64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            ext: ".exe"
+            archive: zip
+          - pkg: windows-arm64
+            os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            ext: ".exe"
+            archive: zip
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.pkg }}
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package archive (Unix)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          STAGE="rusty-conduit-ssh-${TAG}-${{ matrix.pkg }}"
+          mkdir -p "${STAGE}" dist
+          cp "target/${{ matrix.target }}/release/rusty-conduit-ssh" "${STAGE}/"
+          cp README.md LICENSE docs/USER-GUIDE.md "${STAGE}/"
+          tar -czf "dist/${STAGE}.tar.gz" "${STAGE}"
+
+      - name: Package archive (Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $Tag = $env:GITHUB_REF_NAME
+          $Stage = "rusty-conduit-ssh-$Tag-${{ matrix.pkg }}"
+          New-Item -ItemType Directory -Force -Path $Stage, dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/rusty-conduit-ssh.exe" "$Stage/"
+          Copy-Item README.md, LICENSE, docs/USER-GUIDE.md "$Stage/"
+          Compress-Archive -Path $Stage -DestinationPath "dist/$Stage.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.pkg }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum rusty-conduit-ssh-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          gh release create "${TAG}" dist/* \
+            --title "rusty-conduit-ssh ${TAG}" \
+            --generate-notes

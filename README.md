@@ -2,6 +2,7 @@
 
 **A single-binary HTTP/HTTPS and SOCKS4/4a/5 forward proxy that sends all upstream traffic and DNS through an auto-reconnecting `ssh -NT4D` tunnel, with optional pure-Rust HTTPS MITM inspection.**
 
+[![Release](https://img.shields.io/github/v/release/jpbaking/rusty-conduit-ssh)](https://github.com/jpbaking/rusty-conduit-ssh/releases)
 [![License](https://img.shields.io/badge/license-BSD--3--Clause-blue.svg)](LICENSE)
 
 ---
