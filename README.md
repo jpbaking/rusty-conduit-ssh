@@ -22,9 +22,17 @@
 
 ### 1. Install
 
-You need a stable Rust toolchain to build and an OpenSSH `ssh` client at runtime.
+Download a prebuilt binary from **[Releases](https://github.com/jpbaking/rusty-conduit-ssh/releases)**, run with Docker (includes `openssh-client` and `ca-certificates` on Ubuntu 26.04 LTS), or build from source with Rust (requires an OpenSSH `ssh` client at runtime):
 
 ```sh
+# Docker (multi-arch: linux/amd64, linux/arm64; binds 0.0.0.0 inside container)
+docker run --rm \
+  -p 127.0.0.1:3128:3128 \
+  -p 127.0.0.1:1080:1080 \
+  -v ~/.ssh:/home/rusty-conduit-ssh/.ssh:ro \
+  ghcr.io/jpbaking/rusty-conduit-ssh:latest my-bastion
+
+# Or build from source
 cargo install --path .
 ```
 
