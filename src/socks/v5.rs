@@ -138,7 +138,7 @@ pub(super) async fn serve(proxy: &SocksProxy, mut conn: Connection) {
     let peer = conn.peer;
     let logger = &proxy.logger;
     let shutdown = conn.shutdown.clone();
-    let mut session = Session::new(peer, "socks5");
+    let mut session = Session::new(peer, "socks5", proxy.direction);
 
     // Method negotiation + request, bounded together by the handshake timeout.
     let handshake = async {

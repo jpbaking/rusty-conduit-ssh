@@ -3,17 +3,22 @@
 //! Every upstream TCP connection goes through an [`UpstreamDialer`]. In production that is
 //! [`Socks5UpstreamDialer`], which speaks RFC 1928 to the local `ssh -D` listener and sends
 //! hostnames as `ATYP=0x03`, so DNS is resolved on the SSH target and never locally.
-//! [`DirectDialer`] resolves locally and exists for isolated tests.
+//! [`DirectDialer`] connects from this machine using its resolver. It backs the reverse proxy
+//! (`ssh -R`), whose clients egress locally, and isolated tests.
 
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{lookup_host, TcpStream};
 use tokio::sync::watch;
+use tokio::time::Instant;
+
+use crate::filter::{access_denied_error, normalize_domain, AccessDenied, HostFilter};
 
 /// Default timeout for establishing an upstream TCP connection.
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -47,20 +52,144 @@ pub trait UpstreamDialer: Send + Sync {
     fn connect(&self, host: &str, port: u16, timeout: Duration) -> DialFuture<'_>;
 }
 
-/// Dials targets directly using the OS resolver. Intended for isolated tests only.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct DirectDialer;
+/// Dials targets directly from this machine using the OS resolver.
+///
+/// Used for reverse proxy egress, where routing through [`Socks5UpstreamDialer`] would loop
+/// traffic back to the SSH target, and by isolated tests. When a [`HostFilter`] is attached,
+/// both domain names and resolved IP addresses are checked before connecting.
+#[derive(Debug, Clone, Default)]
+pub struct DirectDialer {
+    filter: Option<Arc<HostFilter>>,
+}
+
+impl DirectDialer {
+    /// Create a direct dialer that enforces `filter` on both domain names and resolved IPs.
+    pub fn with_filter(filter: Arc<HostFilter>) -> Self {
+        Self {
+            filter: Some(filter),
+        }
+    }
+}
 
 impl UpstreamDialer for DirectDialer {
     fn connect(&self, host: &str, port: u16, timeout: Duration) -> DialFuture<'_> {
         let host = strip_brackets(host).to_owned();
+        let filter = self.filter.clone();
         Box::pin(async move {
-            let stream = tokio::time::timeout(timeout, TcpStream::connect((host.as_str(), port)))
-                .await
-                .map_err(|_| timed_out(&host, port, timeout))??;
-            stream.set_nodelay(true)?;
-            Ok(stream)
+            let Some(filter) = filter else {
+                let stream =
+                    tokio::time::timeout(timeout, TcpStream::connect((host.as_str(), port)))
+                        .await
+                        .map_err(|_| timed_out(&host, port, timeout))??;
+                stream.set_nodelay(true)?;
+                return Ok(stream);
+            };
+
+            let deadline = Instant::now() + timeout;
+            if let Ok(ip) = host.parse::<IpAddr>() {
+                filter.check_ip(ip).map_err(access_denied_error)?;
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let stream =
+                    tokio::time::timeout(remaining, TcpStream::connect(SocketAddr::new(ip, port)))
+                        .await
+                        .map_err(|_| timed_out(&host, port, timeout))??;
+                stream.set_nodelay(true)?;
+                return Ok(stream);
+            }
+
+            let domain = normalize_domain(&host);
+            let domain_matched = filter.matches_domain(&domain);
+            match filter.as_ref() {
+                HostFilter::Block(_) if domain_matched => {
+                    return Err(access_denied_error(AccessDenied(format!(
+                        "destination {host} is blocklisted"
+                    ))));
+                }
+                HostFilter::Allow(_) if !domain_matched && !filter.has_ip_rules() => {
+                    return Err(access_denied_error(AccessDenied(format!(
+                        "destination {host} is not in allowlist"
+                    ))));
+                }
+                _ => {}
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let resolved: Vec<SocketAddr> =
+                tokio::time::timeout(remaining, lookup_host((host.as_str(), port)))
+                    .await
+                    .map_err(|_| timed_out(&host, port, timeout))??
+                    .collect();
+            if resolved.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrNotAvailable,
+                    format!("DNS returned no addresses for {host}"),
+                ));
+            }
+
+            let candidates: Vec<SocketAddr> = match filter.as_ref() {
+                HostFilter::Block(_) => {
+                    if let Some(blocked) = resolved.iter().find(|a| filter.matches_ip(a.ip())) {
+                        return Err(access_denied_error(AccessDenied(format!(
+                            "destination {host} resolved to blocklisted IP {}",
+                            blocked.ip()
+                        ))));
+                    }
+                    resolved
+                }
+                HostFilter::Allow(_) if domain_matched => resolved,
+                HostFilter::Allow(_) => {
+                    let allowed: Vec<SocketAddr> = resolved
+                        .into_iter()
+                        .filter(|a| filter.matches_ip(a.ip()))
+                        .collect();
+                    if allowed.is_empty() {
+                        return Err(access_denied_error(AccessDenied(format!(
+                            "destination {host} is not in allowlist"
+                        ))));
+                    }
+                    allowed
+                }
+            };
+
+            let mut last_err = None;
+            for addr in candidates {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(timed_out(&host, port, timeout));
+                }
+                match tokio::time::timeout(remaining, TcpStream::connect(addr)).await {
+                    Ok(Ok(stream)) => {
+                        stream.set_nodelay(true)?;
+                        return Ok(stream);
+                    }
+                    Ok(Err(e)) => last_err = Some(e),
+                    Err(_) => return Err(timed_out(&host, port, timeout)),
+                }
+            }
+            Err(last_err.unwrap_or_else(|| timed_out(&host, port, timeout)))
         })
+    }
+}
+
+/// Wraps an [`UpstreamDialer`] and enforces a [`HostFilter`] on the requested host before
+/// dialing (without performing any local DNS lookups).
+pub struct FilteredDialer {
+    inner: Arc<dyn UpstreamDialer>,
+    filter: Arc<HostFilter>,
+}
+
+impl FilteredDialer {
+    pub fn new(inner: Arc<dyn UpstreamDialer>, filter: Arc<HostFilter>) -> Self {
+        Self { inner, filter }
+    }
+}
+
+impl UpstreamDialer for FilteredDialer {
+    fn connect(&self, host: &str, port: u16, timeout: Duration) -> DialFuture<'_> {
+        if let Err(denied) = self.filter.check_host(host) {
+            return Box::pin(async move { Err(access_denied_error(denied)) });
+        }
+        self.inner.connect(host, port, timeout)
     }
 }
 
@@ -444,7 +573,7 @@ mod tests {
         let front_addr = front.local_addr().unwrap();
         let relay = tokio::spawn(async move {
             let (mut client, _) = front.accept().await.unwrap();
-            let mut up = DirectDialer
+            let mut up = DirectDialer::default()
                 .connect("127.0.0.1", upstream_addr.port(), T)
                 .await
                 .unwrap();

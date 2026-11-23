@@ -40,7 +40,7 @@ use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::http::tunnel::CountingStream;
-use crate::logging::{AccessLogger, Logger, SocksLogRecord};
+use crate::logging::{AccessLogger, Logger, ProxyDirection, SocksLogRecord};
 use crate::mux::{self, DetectedProtocol};
 use crate::net::{relay_bidirectional, UpstreamDialer, DEFAULT_CONNECT_TIMEOUT};
 use crate::server::Connection;
@@ -107,6 +107,7 @@ pub trait RelayGuard: Send + Sync + 'static {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Failure {
     General,
+    NotAllowed,
     NetworkUnreachable,
     HostUnreachable,
     ConnectionRefused,
@@ -117,6 +118,9 @@ pub enum Failure {
 impl Failure {
     /// Classify an upstream dial error.
     pub fn from_dial_error(e: &io::Error) -> Self {
+        if crate::filter::is_access_denied(e) {
+            return Self::NotAllowed;
+        }
         match e.kind() {
             io::ErrorKind::ConnectionRefused => Self::ConnectionRefused,
             io::ErrorKind::TimedOut | io::ErrorKind::HostUnreachable => Self::HostUnreachable,
@@ -129,6 +133,7 @@ impl Failure {
     pub fn socks5_reply(self) -> u8 {
         match self {
             Self::General => 0x01,
+            Self::NotAllowed => 0x02,
             Self::NetworkUnreachable => 0x03,
             Self::HostUnreachable => 0x04,
             Self::ConnectionRefused => 0x05,
@@ -141,6 +146,7 @@ impl Failure {
     pub fn label(self) -> &'static str {
         match self {
             Self::General => "general_failure",
+            Self::NotAllowed => "not_allowed",
             Self::NetworkUnreachable => "network_unreachable",
             Self::HostUnreachable => "host_unreachable",
             Self::ConnectionRefused => "connection_refused",
@@ -156,6 +162,7 @@ pub struct SocksProxy {
     pub(crate) access: AccessLogger,
     pub(crate) logger: Logger,
     pub(crate) dialer: Arc<dyn UpstreamDialer>,
+    pub(crate) direction: ProxyDirection,
     pub(crate) connect_timeout: Duration,
     pub(crate) handshake_timeout: Duration,
     pub(crate) guard: Option<Arc<dyn RelayGuard>>,
@@ -164,6 +171,7 @@ pub struct SocksProxy {
 impl fmt::Debug for SocksProxy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SocksProxy")
+            .field("direction", &self.direction)
             .field("connect_timeout", &self.connect_timeout)
             .field("handshake_timeout", &self.handshake_timeout)
             .field("guard", &self.guard.is_some())
@@ -177,10 +185,17 @@ impl SocksProxy {
             access,
             logger,
             dialer,
+            direction: ProxyDirection::Forward,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             guard: None,
         }
+    }
+
+    /// Tag SOCKS log records emitted by this proxy with `direction`.
+    pub fn with_direction(mut self, direction: ProxyDirection) -> Self {
+        self.direction = direction;
+        self
     }
 
     /// Install a first-chunk relay guard (used by `--socks-block-web-in-mitm`).
@@ -363,6 +378,7 @@ where
 pub(crate) struct Session {
     ts: OffsetDateTime,
     start: Instant,
+    direction: ProxyDirection,
     client: SocketAddr,
     pub(crate) proto: &'static str,
     pub(crate) cmd: String,
@@ -370,10 +386,11 @@ pub(crate) struct Session {
 }
 
 impl Session {
-    pub(crate) fn new(client: SocketAddr, proto: &'static str) -> Self {
+    pub(crate) fn new(client: SocketAddr, proto: &'static str, direction: ProxyDirection) -> Self {
         Self {
             ts: OffsetDateTime::now_utc(),
             start: Instant::now(),
+            direction,
             client,
             proto,
             cmd: "-".into(),
@@ -385,6 +402,7 @@ impl Session {
     pub(crate) async fn finish(self, access: &AccessLogger, status: &str, bin: u64, bout: u64) {
         let record = SocksLogRecord {
             ts: self.ts,
+            direction: self.direction,
             client: self.client,
             proto: self.proto.into(),
             cmd: self.cmd,

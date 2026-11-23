@@ -37,7 +37,7 @@ use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-use crate::logging::{AccessLogger, HttpAccessRecord, Logger};
+use crate::logging::{AccessLogger, HttpAccessRecord, Logger, ProxyDirection};
 use crate::net::{UpstreamDialer, DEFAULT_CONNECT_TIMEOUT};
 use crate::server::{Connection, HandlerFuture};
 
@@ -99,6 +99,7 @@ pub struct MitmConnect {
     pub upgraded: TokioIo<Upgraded>,
     pub target: ConnectTarget,
     pub client: SocketAddr,
+    pub direction: ProxyDirection,
     /// Cancelled on server shutdown.
     pub shutdown: CancellationToken,
     pub access: AccessLogger,
@@ -110,6 +111,7 @@ impl fmt::Debug for MitmConnect {
         f.debug_struct("MitmConnect")
             .field("target", &self.target)
             .field("client", &self.client)
+            .field("direction", &self.direction)
             .finish_non_exhaustive()
     }
 }
@@ -126,6 +128,7 @@ pub struct HttpProxy {
     access: AccessLogger,
     logger: Logger,
     dialer: Arc<dyn UpstreamDialer>,
+    direction: ProxyDirection,
     connect_timeout: Duration,
     mitm: Option<Arc<dyn MitmHandler>>,
 }
@@ -133,6 +136,7 @@ pub struct HttpProxy {
 impl fmt::Debug for HttpProxy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HttpProxy")
+            .field("direction", &self.direction)
             .field("connect_timeout", &self.connect_timeout)
             .field("mitm", &self.mitm.is_some())
             .finish_non_exhaustive()
@@ -145,9 +149,16 @@ impl HttpProxy {
             access,
             logger,
             dialer,
+            direction: ProxyDirection::Forward,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             mitm: None,
         }
+    }
+
+    /// Tag access log records emitted by this proxy with `direction`.
+    pub fn with_direction(mut self, direction: ProxyDirection) -> Self {
+        self.direction = direction;
+        self
     }
 
     /// Route every `CONNECT` through `handler` instead of the opaque tunnel.
@@ -242,6 +253,7 @@ impl RequestCtx {
             self.proxy.access.clone(),
             self.proxy.logger.clone(),
         );
+        let direction = self.proxy.direction;
         self.tasks.spawn(async move {
             let (target, client, shutdown, access, logger) = connect_base;
             match hyper::upgrade::on(req).await {
@@ -250,6 +262,7 @@ impl RequestCtx {
                         upgraded: TokioIo::new(upgraded),
                         target,
                         client,
+                        direction,
                         shutdown,
                         access,
                         logger,
@@ -275,6 +288,7 @@ impl RequestCtx {
             self.tasks.clone(),
             HttpAccessRecord {
                 ts: OffsetDateTime::now_utc(),
+                direction: self.proxy.direction,
                 client: self.peer,
                 proto: proto.to_string(),
                 mitm,
@@ -427,9 +441,12 @@ fn empty_body() -> ProxyBody {
     Empty::new().map_err(|never| match never {}).boxed()
 }
 
-/// Map an upstream dial error to the proxy status code (`504` on timeout, else `502`).
+/// Map an upstream dial error to the proxy status code (`403` when filtered, `504` on timeout,
+/// else `502`).
 pub(crate) fn dial_error_status(e: &std::io::Error) -> StatusCode {
-    if e.kind() == std::io::ErrorKind::TimedOut {
+    if crate::filter::is_access_denied(e) {
+        StatusCode::FORBIDDEN
+    } else if e.kind() == std::io::ErrorKind::TimedOut {
         StatusCode::GATEWAY_TIMEOUT
     } else {
         StatusCode::BAD_GATEWAY
@@ -454,7 +471,7 @@ pub(crate) mod test_support {
 
     /// Dialer for isolated tests: connects directly, without a tunnel.
     pub(crate) fn direct_dialer() -> Arc<dyn UpstreamDialer> {
-        Arc::new(DirectDialer)
+        Arc::new(DirectDialer::default())
     }
 
     use super::HttpProxy;

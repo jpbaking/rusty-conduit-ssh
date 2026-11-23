@@ -13,6 +13,7 @@
 - **Auto-reconnect:** A supervisor restarts `ssh` with exponential backoff whenever the tunnel drops, and keepalives detect dead links.
 - **Every protocol on your side:** Plain HTTP forwarding, HTTPS `CONNECT`, SOCKS4, SOCKS4a, and SOCKS5, on separate ports (`3128` / `1080`) or **auto-multiplexed on one port**.
 - **No local DNS lookups for proxied hosts:** Hostnames are handed to the tunnel as names and resolved on the SSH target.
+- **Optional reverse proxy (`ssh -R`):** The same process and SSH connection can also expose an HTTP/HTTPS and SOCKS proxy on the SSH target, so clients there egress through your machine.
 - **Opt-in HTTPS MITM:** Off by default and never auto-generates a CA. Bring a PEM or PKCS#12 CA to inspect HTTP/1.1 and HTTP/2 traffic. TLS is pure Rust (`rustls` + `ring`), with no OpenSSL.
 - **Built for operators:** `CLI > env > TOML` configuration, six log levels, `text` (logfmt) or `json` (NDJSON) access logs, graceful shutdown, and connection and certificate-cache caps.
 
@@ -67,6 +68,23 @@ rusty-conduit-ssh user@host -p 2222 -i ~/.ssh/id_ed25519 -J jump.example.com
 
 # Anything else goes to ssh verbatim after --
 rusty-conduit-ssh my-bastion -- -v -C -o BatchMode=yes
+
+# Also let clients on the SSH target egress through this machine, on one remote port
+rusty-conduit-ssh my-bastion --reverse-http-port 8888 --reverse-socks-port 8888
+
+# Reverse proxy only, with no local forward listeners
+rusty-conduit-ssh my-bastion --http-port 0 --socks-port 0 --reverse-http-port 8888
+
+# Reverse proxy with a blocklist so remote clients cannot reach your loopback or LAN
+rusty-conduit-ssh my-bastion --reverse-http-port 8888 --reverse-socks-port 8888 \
+  --reverse-block 127.0.0.0/8,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+```
+
+On the SSH target, use the reverse proxy like any other:
+
+```sh
+curl -x http://127.0.0.1:8888 https://example.com/
+curl --socks5-hostname 127.0.0.1:8888 https://example.com/
 ```
 
 ---
@@ -89,6 +107,7 @@ rusty-conduit-ssh my-bastion -- -v -C -o BatchMode=yes
 - The **supervisor** runs `ssh -N -T -4 -D <local-port>`, confirms the SOCKS listener answers, and restarts `ssh` when it exits.
 - The **listeners** accept client connections. When both ports match, the first byte of each connection selects the protocol.
 - The **dialer** opens every upstream connection through the `ssh -D` listener and passes hostnames unresolved.
+- The optional **reverse proxy** listens on an ephemeral local loopback port, is published on the SSH target with `ssh -R`, and dials directly from your machine. It never uses the `ssh -D` path, so traffic cannot loop.
 - **Nothing is cached** except MITM leaf certificates, which are bounded by a TTL and an entry cap.
 
 ---
@@ -96,6 +115,7 @@ rusty-conduit-ssh my-bastion -- -v -C -o BatchMode=yes
 ## Security notes
 
 - v1 has **no proxy authentication**. Keep the default loopback bind, or restrict access with a firewall if you use `--bind` with another address.
+- The **reverse proxy** lets anyone who can reach its remote port connect to whatever your machine can reach, **including services on your loopback interface and LAN**. Keep the default `--reverse-bind 127.0.0.1`, and enable it only on SSH targets whose local users you trust.
 - Your machine still resolves the **SSH target's own hostname**, because `ssh` must reach it before the tunnel exists.
 - MITM decrypts traffic. Only use it on systems and traffic you are authorized to inspect, and protect the CA private key.
 
@@ -103,7 +123,7 @@ rusty-conduit-ssh my-bastion -- -v -C -o BatchMode=yes
 
 ## Documentation
 
-See the **[User Guide](docs/USER-GUIDE.md)** for the full CLI, environment, and TOML reference, SSH authentication tips, reconnect tuning, and HTTPS MITM setup.
+See the **[User Guide](docs/USER-GUIDE.md)** for the full CLI, environment, and TOML reference, SSH authentication tips, reconnect tuning, the reverse proxy, and HTTPS MITM setup.
 
 ---
 

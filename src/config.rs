@@ -22,6 +22,7 @@ use clap::{ArgAction, ArgMatches, CommandFactory, FromArgMatches, Parser};
 use serde::de::{self, Deserializer, Visitor};
 use serde::Deserialize;
 
+use crate::filter::{FilterRule, HostFilter};
 use crate::logging::{LogFormat, LogLevel};
 
 /// Default bind address.
@@ -30,6 +31,8 @@ pub const DEFAULT_BIND: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 pub const DEFAULT_HTTP_PORT: u16 = 3128;
 /// Default SOCKS4/5 proxy port.
 pub const DEFAULT_SOCKS_PORT: u16 = 1080;
+/// Default remote bind address of the reverse proxy (`ssh -R`).
+pub const DEFAULT_REVERSE_BIND: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 /// Default in-memory TTL for generated MITM leaf certificates.
 pub const DEFAULT_MITM_CERT_TTL: Duration = Duration::from_secs(60 * 60);
 /// Smallest accepted MITM leaf certificate TTL.
@@ -139,7 +142,9 @@ pub enum ConfigError {
     ParseFile { path: PathBuf, message: String },
     #[error("invalid value for `{key}` in config file: {message}")]
     InvalidFileValue { key: &'static str, message: String },
-    #[error("both http_port and socks_port are 0: at least one listener must be enabled")]
+    #[error(
+        "http_port, socks_port, reverse_http_port, and reverse_socks_port are all 0: at least one listener must be enabled"
+    )]
     NoListeners,
     #[error(
         "ambiguous MITM CA source: --mitm-ca-p12 cannot be combined with --mitm-ca-cert or --mitm-ca-key"
@@ -171,6 +176,8 @@ pub enum ConfigError {
         humantime::format_duration(*.max)
     )]
     ReconnectDelayOrder { initial: Duration, max: Duration },
+    #[error("conflicting {scope} filter: cannot set both allowlist and blocklist")]
+    ConflictingFilter { scope: &'static str },
 }
 
 /// Raw command-line / environment input (`clap` derive with `env` fallbacks).
@@ -214,6 +221,58 @@ pub struct CliArgs {
     /// Maximum concurrent client connections; excess connections are closed immediately, 0 = unlimited [default: 4096]
     #[arg(long, value_name = "N", env = "RUSTY_CONDUIT_SSH_MAX_CONNECTIONS")]
     pub max_connections: Option<usize>,
+
+    /// Allowlist of destinations for the forward proxy (IP, CIDR, FQDN, or *.domain); repeatable or comma-separated
+    #[arg(
+        long,
+        value_name = "RULE",
+        value_delimiter = ',',
+        env = "RUSTY_CONDUIT_SSH_ALLOW"
+    )]
+    pub allow: Vec<FilterRule>,
+
+    /// Blocklist of destinations for the forward proxy (IP, CIDR, FQDN, or *.domain); repeatable or comma-separated
+    #[arg(
+        long,
+        value_name = "RULE",
+        value_delimiter = ',',
+        env = "RUSTY_CONDUIT_SSH_BLOCK"
+    )]
+    pub block: Vec<FilterRule>,
+
+    /// Remote bind IP on the SSH target for the reverse proxy (ssh -R) [default: 127.0.0.1]
+    #[arg(long, value_name = "IP", env = "RUSTY_CONDUIT_SSH_REVERSE_BIND")]
+    pub reverse_bind: Option<IpAddr>,
+
+    /// Remote HTTP/HTTPS proxy port on the SSH target (egress via this machine), 0 to disable [default: 0]
+    #[arg(long, value_name = "PORT", env = "RUSTY_CONDUIT_SSH_REVERSE_HTTP_PORT")]
+    pub reverse_http_port: Option<u16>,
+
+    /// Remote SOCKS4/4a/5 proxy port on the SSH target (egress via this machine), 0 to disable [default: 0]
+    #[arg(
+        long,
+        value_name = "PORT",
+        env = "RUSTY_CONDUIT_SSH_REVERSE_SOCKS_PORT"
+    )]
+    pub reverse_socks_port: Option<u16>,
+
+    /// Allowlist of destinations for the reverse proxy (IP, CIDR, FQDN, or *.domain); repeatable or comma-separated
+    #[arg(
+        long,
+        value_name = "RULE",
+        value_delimiter = ',',
+        env = "RUSTY_CONDUIT_SSH_REVERSE_ALLOW"
+    )]
+    pub reverse_allow: Vec<FilterRule>,
+
+    /// Blocklist of destinations for the reverse proxy (IP, CIDR, FQDN, or *.domain); repeatable or comma-separated
+    #[arg(
+        long,
+        value_name = "RULE",
+        value_delimiter = ',',
+        env = "RUSTY_CONDUIT_SSH_REVERSE_BLOCK"
+    )]
+    pub reverse_block: Vec<FilterRule>,
 
     /// Path to PEM-encoded CA certificate (enables MITM together with --mitm-ca-key)
     #[arg(long, value_name = "PATH", env = "RUSTY_CONDUIT_SSH_MITM_CA_CERT")]
@@ -462,12 +521,27 @@ pub struct FileConfig {
     pub http_port: Option<u16>,
     pub socks_port: Option<u16>,
     pub max_connections: Option<usize>,
+    pub allow: Option<Vec<String>>,
+    pub block: Option<Vec<String>>,
     #[serde(default)]
     pub mitm: FileMitmConfig,
     #[serde(default)]
     pub logging: FileLoggingConfig,
     #[serde(default)]
     pub ssh: FileSshConfig,
+    #[serde(default)]
+    pub reverse: FileReverseConfig,
+}
+
+/// `[reverse]` table of the TOML configuration file.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FileReverseConfig {
+    pub bind: Option<IpAddr>,
+    pub http_port: Option<u16>,
+    pub socks_port: Option<u16>,
+    pub allow: Option<Vec<String>>,
+    pub block: Option<Vec<String>>,
 }
 
 /// `[mitm]` table of the TOML configuration file.
@@ -521,6 +595,23 @@ pub struct FileSshConfig {
     pub extra_args: Option<Vec<String>>,
 }
 
+/// Parse an optional list of filter rules from the TOML file.
+fn file_filter_rules(
+    key: &'static str,
+    values: Option<Vec<String>>,
+) -> Result<Vec<FilterRule>, ConfigError> {
+    match values {
+        None => Ok(Vec::new()),
+        Some(list) => list
+            .into_iter()
+            .map(|raw| {
+                raw.parse::<FilterRule>()
+                    .map_err(|message| ConfigError::InvalidFileValue { key, message })
+            })
+            .collect(),
+    }
+}
+
 /// Parse an optional human-readable duration from the TOML file.
 fn file_duration(key: &'static str, value: Option<&str>) -> Result<Option<Duration>, ConfigError> {
     value
@@ -568,6 +659,20 @@ pub struct Config {
     pub socks_port: u16,
     /// Maximum concurrent client connections (`0` = unlimited).
     pub max_connections: usize,
+    /// Forward proxy destination allowlist (mutually exclusive with `block`).
+    pub allow: Vec<FilterRule>,
+    /// Forward proxy destination blocklist (mutually exclusive with `allow`).
+    pub block: Vec<FilterRule>,
+    /// Remote bind address for `ssh -R` on the SSH target.
+    pub reverse_bind: IpAddr,
+    /// Remote HTTP/HTTPS reverse proxy port (`0` = disabled).
+    pub reverse_http_port: u16,
+    /// Remote SOCKS4/4a/5 reverse proxy port (`0` = disabled).
+    pub reverse_socks_port: u16,
+    /// Reverse proxy destination allowlist (mutually exclusive with `reverse_block`).
+    pub reverse_allow: Vec<FilterRule>,
+    /// Reverse proxy destination blocklist (mutually exclusive with `reverse_allow`).
+    pub reverse_block: Vec<FilterRule>,
     pub mitm_ca_cert: Option<PathBuf>,
     pub mitm_ca_key: Option<PathBuf>,
     pub mitm_ca_p12: Option<PathBuf>,
@@ -612,6 +717,9 @@ impl fmt::Debug for Config {
             .field("http_port", &self.http_port)
             .field("socks_port", &self.socks_port)
             .field("max_connections", &self.max_connections)
+            .field("reverse_bind", &self.reverse_bind)
+            .field("reverse_http_port", &self.reverse_http_port)
+            .field("reverse_socks_port", &self.reverse_socks_port)
             .field("mitm_ca_cert", &self.mitm_ca_cert)
             .field("mitm_ca_key", &self.mitm_ca_key)
             .field("mitm_ca_p12", &self.mitm_ca_p12)
@@ -665,6 +773,13 @@ impl Default for Config {
             http_port: DEFAULT_HTTP_PORT,
             socks_port: DEFAULT_SOCKS_PORT,
             max_connections: DEFAULT_MAX_CONNECTIONS,
+            allow: Vec::new(),
+            block: Vec::new(),
+            reverse_bind: DEFAULT_REVERSE_BIND,
+            reverse_http_port: 0,
+            reverse_socks_port: 0,
+            reverse_allow: Vec::new(),
+            reverse_block: Vec::new(),
             mitm_ca_cert: None,
             mitm_ca_key: None,
             mitm_ca_p12: None,
@@ -778,6 +893,31 @@ impl Config {
         } else {
             file.ssh.no_reconnect.unwrap_or(d.no_reconnect)
         };
+        let file_allow = file_filter_rules("allow", file.allow)?;
+        let file_block = file_filter_rules("block", file.block)?;
+        let file_reverse_allow = file_filter_rules("reverse.allow", file.reverse.allow)?;
+        let file_reverse_block = file_filter_rules("reverse.block", file.reverse.block)?;
+        let allow = if a.allow.is_empty() {
+            file_allow
+        } else {
+            a.allow
+        };
+        let block = if a.block.is_empty() {
+            file_block
+        } else {
+            a.block
+        };
+        let reverse_allow = if a.reverse_allow.is_empty() {
+            file_reverse_allow
+        } else {
+            a.reverse_allow
+        };
+        let reverse_block = if a.reverse_block.is_empty() {
+            file_reverse_block
+        } else {
+            a.reverse_block
+        };
+
         let ssh_extra_args = if a.ssh_args.is_empty() {
             file.ssh.extra_args.unwrap_or_default()
         } else {
@@ -793,6 +933,22 @@ impl Config {
                 .max_connections
                 .or(file.max_connections)
                 .unwrap_or(d.max_connections),
+            allow,
+            block,
+            reverse_bind: a
+                .reverse_bind
+                .or(file.reverse.bind)
+                .unwrap_or(d.reverse_bind),
+            reverse_http_port: a
+                .reverse_http_port
+                .or(file.reverse.http_port)
+                .unwrap_or(d.reverse_http_port),
+            reverse_socks_port: a
+                .reverse_socks_port
+                .or(file.reverse.socks_port)
+                .unwrap_or(d.reverse_socks_port),
+            reverse_allow,
+            reverse_block,
             mitm_ca_cert: a.mitm_ca_cert.or(file.mitm.ca_cert),
             mitm_ca_key: a.mitm_ca_key.or(file.mitm.ca_key),
             mitm_ca_p12: a.mitm_ca_p12.or(file.mitm.ca_p12),
@@ -854,7 +1010,7 @@ impl Config {
 
     /// Apply the `FATAL` startup validation rules.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.http_port == 0 && self.socks_port == 0 {
+        if !self.forward_enabled() && !self.reverse_enabled() {
             return Err(ConfigError::NoListeners);
         }
         if self.mitm_ca_p12.is_some() && (self.mitm_ca_cert.is_some() || self.mitm_ca_key.is_some())
@@ -881,7 +1037,35 @@ impl Config {
                 max: self.reconnect_max_delay,
             });
         }
+        if !self.allow.is_empty() && !self.block.is_empty() {
+            return Err(ConfigError::ConflictingFilter { scope: "forward" });
+        }
+        if !self.reverse_allow.is_empty() && !self.reverse_block.is_empty() {
+            return Err(ConfigError::ConflictingFilter { scope: "reverse" });
+        }
         Ok(())
+    }
+
+    /// The configured forward destination filter, or `None` when unfiltered.
+    pub fn forward_filter(&self) -> Option<HostFilter> {
+        if !self.allow.is_empty() {
+            Some(HostFilter::Allow(self.allow.clone()))
+        } else if !self.block.is_empty() {
+            Some(HostFilter::Block(self.block.clone()))
+        } else {
+            None
+        }
+    }
+
+    /// The configured reverse destination filter, or `None` when unfiltered.
+    pub fn reverse_filter(&self) -> Option<HostFilter> {
+        if !self.reverse_allow.is_empty() {
+            Some(HostFilter::Allow(self.reverse_allow.clone()))
+        } else if !self.reverse_block.is_empty() {
+            Some(HostFilter::Block(self.reverse_block.clone()))
+        } else {
+            None
+        }
     }
 
     /// The configured MITM CA source, or `None` when MITM mode is OFF.
@@ -904,6 +1088,21 @@ impl Config {
     /// Whether both listeners share one port (single-port first-byte multiplexing).
     pub fn is_multiplexed(&self) -> bool {
         self.http_port > 0 && self.http_port == self.socks_port
+    }
+
+    /// Whether at least one forward (`ssh -D`) listener is enabled.
+    pub fn forward_enabled(&self) -> bool {
+        self.http_port != 0 || self.socks_port != 0
+    }
+
+    /// Whether at least one reverse (`ssh -R`) listener is enabled.
+    pub fn reverse_enabled(&self) -> bool {
+        self.reverse_http_port != 0 || self.reverse_socks_port != 0
+    }
+
+    /// Whether both reverse listeners share one port (first-byte multiplexing).
+    pub fn is_reverse_multiplexed(&self) -> bool {
+        self.reverse_http_port > 0 && self.reverse_http_port == self.reverse_socks_port
     }
 
     /// Whether the bind address is reachable beyond the local host.
@@ -947,6 +1146,15 @@ impl Config {
                 "SECURITY NOTICE: binding to non-loopback address {}; rusty-conduit-ssh v1 has NO \
                  authentication, so anyone who can reach this address can use the proxy",
                 self.bind
+            ));
+        }
+        if self.reverse_enabled() && !self.reverse_bind.is_loopback() {
+            out.push(format!(
+                "SECURITY NOTICE: reverse proxy binds to non-loopback address {} on the SSH \
+                 target (requires sshd GatewayPorts); it has NO authentication, so anyone who \
+                 can reach that address can egress through this machine and reach its local \
+                 services",
+                self.reverse_bind
             ));
         }
         if self.passphrase_from_cli {
@@ -993,13 +1201,32 @@ impl Config {
             Some(CaSource::Pkcs12 { .. }) => "on(pkcs12)",
             None => "off",
         };
+        let filter = self
+            .forward_filter()
+            .map(|f| format!(" filter={}({})", f.mode_str(), f.len()))
+            .unwrap_or_default();
+        let reverse = if self.reverse_enabled() {
+            let reverse_filter = self
+                .reverse_filter()
+                .map(|f| format!(" reverse_filter={}({})", f.mode_str(), f.len()))
+                .unwrap_or_default();
+            format!(
+                " reverse_bind={} reverse_http_port={} reverse_socks_port={} reverse_multiplexed={}{reverse_filter}",
+                self.reverse_bind,
+                port(self.reverse_http_port),
+                port(self.reverse_socks_port),
+                self.is_reverse_multiplexed(),
+            )
+        } else {
+            String::new()
+        };
         format!(
             "bind={} http_port={} socks_port={} multiplexed={} max_connections={} mitm={} \
              mitm_cert_ttl={} mitm_cert_cache_max_entries={} socks_block_web_in_mitm={} log_level={} log_format={} http_access_log={} socks_log={} \
              config={} ssh_target={} ssh_bin={} ssh_socks_bind={} ssh_socks_port={} \
              ssh_ip_version={} ssh_server_alive_interval={} ssh_server_alive_count_max={} \
              no_reconnect={} reconnect_initial_delay={} reconnect_max_delay={} \
-             ssh_startup_timeout={} ssh_extra_args={}",
+             ssh_startup_timeout={} ssh_extra_args={}{filter}{reverse}",
             self.bind,
             port(self.http_port),
             port(self.socks_port),
@@ -1049,6 +1276,13 @@ mod tests {
         "RUSTY_CONDUIT_SSH_HTTP_PORT",
         "RUSTY_CONDUIT_SSH_SOCKS_PORT",
         "RUSTY_CONDUIT_SSH_MAX_CONNECTIONS",
+        "RUSTY_CONDUIT_SSH_ALLOW",
+        "RUSTY_CONDUIT_SSH_BLOCK",
+        "RUSTY_CONDUIT_SSH_REVERSE_BIND",
+        "RUSTY_CONDUIT_SSH_REVERSE_HTTP_PORT",
+        "RUSTY_CONDUIT_SSH_REVERSE_SOCKS_PORT",
+        "RUSTY_CONDUIT_SSH_REVERSE_ALLOW",
+        "RUSTY_CONDUIT_SSH_REVERSE_BLOCK",
         "RUSTY_CONDUIT_SSH_MITM_CERT_CACHE_MAX_ENTRIES",
         "RUSTY_CONDUIT_SSH_MITM_CA_CERT",
         "RUSTY_CONDUIT_SSH_MITM_CA_KEY",
@@ -1972,6 +2206,144 @@ extra_args = ["-o", "Compression=yes"]
         }
     }
 
+    // ---- Reverse proxy ----
+
+    const REVERSE_TOML: &str =
+        "[reverse]\nbind = \"127.0.0.2\"\nhttp_port = 7001\nsocks_port = 7002\n";
+
+    #[test]
+    fn reverse_is_disabled_by_default() {
+        let _env = EnvGuard::new(&[]);
+        let cfg = load(&[]).unwrap();
+        assert_eq!(cfg.reverse_bind, DEFAULT_REVERSE_BIND);
+        assert_eq!((cfg.reverse_http_port, cfg.reverse_socks_port), (0, 0));
+        assert!(!cfg.reverse_enabled());
+        assert!(!cfg.is_reverse_multiplexed());
+        assert!(!cfg.summary().contains("reverse_"));
+    }
+
+    #[test]
+    fn reverse_toml_env_cli_precedence() {
+        let path = temp_file(REVERSE_TOML);
+        let config = path.to_str().unwrap();
+        let _env = EnvGuard::new(&[]);
+        let cfg = load(&["--config", config]).unwrap();
+        assert_eq!(cfg.reverse_bind, "127.0.0.2".parse::<IpAddr>().unwrap());
+        assert_eq!(
+            (cfg.reverse_http_port, cfg.reverse_socks_port),
+            (7001, 7002)
+        );
+        drop(_env);
+
+        let _env = EnvGuard::new(&[
+            ("RUSTY_CONDUIT_SSH_REVERSE_BIND", "::1"),
+            ("RUSTY_CONDUIT_SSH_REVERSE_HTTP_PORT", "7101"),
+        ]);
+        let cfg = load(&["--config", config]).unwrap();
+        assert_eq!(cfg.reverse_bind, "::1".parse::<IpAddr>().unwrap());
+        assert_eq!(
+            (cfg.reverse_http_port, cfg.reverse_socks_port),
+            (7101, 7002)
+        );
+
+        let cfg = load(&[
+            "--config",
+            config,
+            "--reverse-bind",
+            "127.0.0.3",
+            "--reverse-http-port",
+            "0",
+            "--reverse-socks-port",
+            "7202",
+        ])
+        .unwrap();
+        assert_eq!(cfg.reverse_bind, "127.0.0.3".parse::<IpAddr>().unwrap());
+        assert_eq!((cfg.reverse_http_port, cfg.reverse_socks_port), (0, 7202));
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn reverse_rejects_invalid_values() {
+        let _env = EnvGuard::new(&[]);
+        for args in [
+            &["rusty-conduit-ssh", "--reverse-bind", "nope"][..],
+            &["rusty-conduit-ssh", "--reverse-http-port", "70000"][..],
+            &["rusty-conduit-ssh", "--reverse-socks-port", "-1"][..],
+        ] {
+            assert!(CliInput::try_parse_from(args).is_err(), "{args:?}");
+        }
+        let path = temp_file("[reverse]\nunknown = 1\n");
+        let err = load(&["--config", path.to_str().unwrap()]).unwrap_err();
+        assert!(matches!(err, ConfigError::ParseFile { .. }), "{err}");
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn reverse_only_mode_passes_validation() {
+        let _env = EnvGuard::new(&[]);
+        for flag in ["--reverse-http-port", "--reverse-socks-port"] {
+            let cfg = load(&["--http-port", "0", "--socks-port", "0", flag, "8888"]).unwrap();
+            assert!(!cfg.forward_enabled());
+            assert!(cfg.reverse_enabled());
+        }
+        let err = load(&[
+            "--http-port",
+            "0",
+            "--socks-port",
+            "0",
+            "--reverse-http-port",
+            "0",
+            "--reverse-socks-port",
+            "0",
+        ])
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::NoListeners));
+    }
+
+    #[test]
+    fn reverse_multiplexing_and_summary() {
+        let _env = EnvGuard::new(&[]);
+        let cfg = load(&[
+            "--reverse-http-port",
+            "8888",
+            "--reverse-socks-port",
+            "8888",
+        ])
+        .unwrap();
+        assert!(cfg.is_reverse_multiplexed());
+        let s = cfg.summary();
+        assert!(s.contains("reverse_bind=127.0.0.1"), "{s}");
+        assert!(s.contains("reverse_http_port=8888"), "{s}");
+        assert!(s.contains("reverse_socks_port=8888"), "{s}");
+        assert!(s.contains("reverse_multiplexed=true"), "{s}");
+
+        let cfg = load(&["--reverse-socks-port", "8889"]).unwrap();
+        assert!(!cfg.is_reverse_multiplexed());
+        let s = cfg.summary();
+        assert!(s.contains("reverse_http_port=disabled"), "{s}");
+        assert!(s.contains("reverse_socks_port=8889"), "{s}");
+    }
+
+    #[test]
+    fn reverse_notice_only_for_enabled_non_loopback_bind() {
+        let _env = EnvGuard::new(&[]);
+        let cfg = load(&["--reverse-bind", "0.0.0.0", "--reverse-http-port", "8888"]).unwrap();
+        let notices = cfg.notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains("reverse proxy"), "{notices:?}");
+        assert!(notices[0].contains("NO authentication"), "{notices:?}");
+
+        // Set but disabled, or loopback: nothing to warn about.
+        assert!(load(&["--reverse-bind", "0.0.0.0"])
+            .unwrap()
+            .notices()
+            .is_empty());
+        for bind in ["127.0.0.1", "::1"] {
+            let cfg = load(&["--reverse-bind", bind, "--reverse-http-port", "8888"]).unwrap();
+            assert!(cfg.notices().is_empty(), "{bind}");
+        }
+    }
+
     #[test]
     fn ssh_extra_args_are_never_logged() {
         let _env = EnvGuard::new(&[]);
@@ -1983,5 +2355,89 @@ extra_args = ["-o", "Compression=yes"]
         assert!(s.contains("ssh_extra_args=2"), "{s}");
         assert!(s.contains("ssh_target=test-host"), "{s}");
         assert!(s.contains("ssh_socks_port=ephemeral"), "{s}");
+    }
+
+    #[test]
+    fn filter_cli_env_toml_and_conflict_validation() {
+        let _env = EnvGuard::new(&[]);
+        // CLI repeatable + comma-separated
+        let cfg = load(&[
+            "--allow",
+            "*.example.com,10.0.0.0/8",
+            "--allow",
+            "127.0.0.1",
+            "--reverse-http-port",
+            "8888",
+            "--reverse-block",
+            "127.0.0.0/8,::1,*.internal",
+        ])
+        .unwrap();
+        assert_eq!(cfg.allow.len(), 3);
+        assert!(cfg.block.is_empty());
+        assert_eq!(cfg.reverse_block.len(), 3);
+        assert!(cfg.reverse_allow.is_empty());
+        let s = cfg.summary();
+        assert!(s.contains("filter=allow(3)"), "{s}");
+        assert!(s.contains("reverse_filter=block(3)"), "{s}");
+
+        // Mutual exclusion: forward allow + block
+        let err = load(&["--allow", "example.com", "--block", "127.0.0.1"]).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::ConflictingFilter { scope: "forward" }),
+            "{err:?}"
+        );
+
+        // Mutual exclusion: reverse allow + block
+        let err = load(&[
+            "--reverse-http-port",
+            "8888",
+            "--reverse-allow",
+            "example.com",
+            "--reverse-block",
+            "127.0.0.1",
+        ])
+        .unwrap_err();
+        assert!(
+            matches!(err, ConfigError::ConflictingFilter { scope: "reverse" }),
+            "{err:?}"
+        );
+
+        // TOML parsing + env override
+        let toml_path = temp_file(
+            r#"
+allow = ["example.com", "192.168.0.0/16"]
+[ssh]
+target = "toml-host"
+[reverse]
+http_port = 8888
+block = ["127.0.0.0/8", "::1"]
+"#,
+        );
+        let cli = CliInput::try_parse_from([
+            "rusty-conduit-ssh",
+            "--config",
+            toml_path.to_str().unwrap(),
+        ])
+        .unwrap();
+        let cfg = Config::from_cli(cli).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.allow.len(), 2);
+        assert_eq!(cfg.reverse_block.len(), 2);
+
+        // Cross-source conflict (TOML allow + CLI block) is rejected
+        let cli = CliInput::try_parse_from([
+            "rusty-conduit-ssh",
+            "--config",
+            toml_path.to_str().unwrap(),
+            "--block",
+            "10.0.0.0/8",
+        ])
+        .unwrap();
+        let cfg = Config::from_cli(cli).unwrap();
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::ConflictingFilter { scope: "forward" })
+        ));
+        let _ = fs::remove_file(&toml_path);
     }
 }

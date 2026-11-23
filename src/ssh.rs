@@ -29,6 +29,23 @@ use crate::net::TunnelState;
 const TERMINATE_GRACE: Duration = Duration::from_secs(3);
 const PROBE_INTERVAL: Duration = Duration::from_millis(100);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+/// With `-R`, the `-D` probe can pass before sshd has answered the remote bind request, so a
+/// tunnel must stay up this long before a drop resets the reconnect backoff.
+const REVERSE_STABLE_UPTIME: Duration = Duration::from_secs(5);
+
+/// One `ssh -R` forward: `remote` is bound on the SSH target and connects back to `local`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReverseForward {
+    pub remote: SocketAddr,
+    pub local: SocketAddr,
+}
+
+impl ReverseForward {
+    /// The `-R` argument. `SocketAddr` formatting brackets IPv6 as OpenSSH requires.
+    pub fn spec(&self) -> String {
+        format!("{}:{}", self.remote, self.local)
+    }
+}
 
 /// Settings for the supervised `ssh` process.
 #[derive(Clone, PartialEq, Eq)]
@@ -51,6 +68,8 @@ pub struct SshTunnelConfig {
     pub startup_timeout: Duration,
     /// Passed to `ssh` verbatim; may carry sensitive values, so never logged.
     pub extra_args: Vec<String>,
+    /// Reverse forwards passed as `-R`; empty when the reverse proxy is disabled.
+    pub reverse_forwards: Vec<ReverseForward>,
     /// Inherit stdin/stderr for interactive auth. When false both are discarded.
     pub inherit_stdio: bool,
 }
@@ -77,6 +96,7 @@ impl fmt::Debug for SshTunnelConfig {
                 "extra_args",
                 &format_args!("<{} redacted>", self.extra_args.len()),
             )
+            .field("reverse_forwards", &self.reverse_forwards)
             .field("inherit_stdio", &self.inherit_stdio)
             .finish()
     }
@@ -109,6 +129,7 @@ impl SshTunnelConfig {
             reconnect_max_delay: cfg.reconnect_max_delay,
             startup_timeout: cfg.ssh_startup_timeout,
             extra_args: cfg.ssh_extra_args.clone(),
+            reverse_forwards: Vec::new(),
             inherit_stdio: true,
         })
     }
@@ -153,6 +174,9 @@ pub fn build_ssh_args(cfg: &SshTunnelConfig, socks_addr: SocketAddr) -> Vec<Stri
         "-o".to_owned(),
         format!("ServerAliveCountMax={}", cfg.server_alive_count_max),
     ]);
+    for forward in &cfg.reverse_forwards {
+        args.extend(["-R".to_owned(), forward.spec()]);
+    }
     if let Some(port) = cfg.port {
         args.extend(["-p".to_owned(), port.to_string()]);
     }
@@ -178,6 +202,12 @@ fn whole_seconds(d: Duration) -> u64 {
 
 fn next_delay(current: Duration, max: Duration) -> Duration {
     current.saturating_mul(2).min(max)
+}
+
+/// Whether a drop after `uptime` should reset the backoff. A rejected `-R` bind exits `ssh`
+/// just after the `-D` probe passes, and must not retry at the initial delay forever.
+fn resets_backoff(cfg: &SshTunnelConfig, uptime: Duration) -> bool {
+    cfg.reverse_forwards.is_empty() || uptime >= REVERSE_STABLE_UPTIME
 }
 
 /// Handle to a running supervisor.
@@ -358,6 +388,7 @@ async fn run_attempt(
 
     state.send_replace(TunnelState::Ready(addr));
     logger.info(format!("SSH tunnel ready on {addr}"));
+    let ready_at = Instant::now();
 
     tokio::select! {
         biased;
@@ -365,7 +396,9 @@ async fn run_attempt(
             terminate(&mut child).await;
             Attempt::Stopped
         }
-        status = child.wait() => dropped(exit_reason(status), true),
+        status = child.wait() => {
+            dropped(exit_reason(status), resets_backoff(cfg, ready_at.elapsed()))
+        }
     }
 }
 
@@ -573,6 +606,61 @@ mod tests {
         cfg.target = "-oProxyCommand=evil".into();
         let args = build_ssh_args(&cfg, addr(1081));
         assert_eq!(&args[args.len() - 2..], ["--", "-oProxyCommand=evil"]);
+    }
+
+    fn reverse(remote: &str, local: &str) -> ReverseForward {
+        ReverseForward {
+            remote: remote.parse().unwrap(),
+            local: local.parse().unwrap(),
+        }
+    }
+
+    fn reverse_specs(args: &[String]) -> Vec<&str> {
+        args.windows(2)
+            .filter(|w| w[0] == "-R")
+            .map(|w| w[1].as_str())
+            .collect()
+    }
+
+    #[test]
+    fn argv_has_no_reverse_forward_by_default() {
+        let args = build_ssh_args(&base_config(), addr(1081));
+        assert!(!args.iter().any(|a| a == "-R"), "{args:?}");
+    }
+
+    #[test]
+    fn argv_multiplexed_ipv4_reverse_forward() {
+        let mut cfg = base_config();
+        cfg.reverse_forwards = vec![reverse("127.0.0.1:8888", "127.0.0.1:54321")];
+        let args = build_ssh_args(&cfg, addr(1081));
+        assert_eq!(reverse_specs(&args), ["127.0.0.1:8888:127.0.0.1:54321"]);
+        assert!(args.iter().any(|a| a == "ExitOnForwardFailure=yes"));
+        let separator = args.iter().position(|a| a == "--").unwrap();
+        let flag = args.iter().position(|a| a == "-R").unwrap();
+        assert!(flag < separator, "{args:?}");
+    }
+
+    #[test]
+    fn argv_separate_ipv6_reverse_forwards() {
+        let mut cfg = base_config();
+        cfg.reverse_forwards = vec![
+            reverse("[::1]:8888", "127.0.0.1:54321"),
+            reverse("[::1]:1081", "127.0.0.1:54322"),
+        ];
+        let args = build_ssh_args(&cfg, addr(1081));
+        assert_eq!(
+            reverse_specs(&args),
+            ["[::1]:8888:127.0.0.1:54321", "[::1]:1081:127.0.0.1:54322"]
+        );
+    }
+
+    #[test]
+    fn backoff_reset_requires_stable_uptime_only_with_reverse() {
+        let mut cfg = base_config();
+        assert!(resets_backoff(&cfg, Duration::ZERO));
+        cfg.reverse_forwards = vec![reverse("127.0.0.1:8888", "127.0.0.1:54321")];
+        assert!(!resets_backoff(&cfg, Duration::from_millis(100)));
+        assert!(resets_backoff(&cfg, REVERSE_STABLE_UPTIME));
     }
 
     #[test]

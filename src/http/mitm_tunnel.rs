@@ -53,7 +53,7 @@ use super::{
     dial_error_status, error_response, AccessGuard, ConnectTarget, CountingBody, MitmConnect,
     MitmHandler, ProxyBody,
 };
-use crate::logging::{AccessLogger, HttpAccessRecord, Logger};
+use crate::logging::{AccessLogger, HttpAccessRecord, Logger, ProxyDirection};
 use crate::mitm::cache::CertCache;
 use crate::net::{relay_bidirectional, UpstreamDialer, DEFAULT_CONNECT_TIMEOUT};
 use crate::server::HandlerFuture;
@@ -157,6 +157,7 @@ struct Session {
     tasks: TaskTracker,
     shutdown: CancellationToken,
     client: SocketAddr,
+    direction: ProxyDirection,
     /// Authority used when a request carries neither an absolute URI nor `Host`.
     default_authority: String,
     dialer: Dialer,
@@ -195,13 +196,21 @@ impl MitmInterceptor {
             upgraded,
             target,
             client,
+            direction,
             shutdown,
             access,
             logger,
         } = connect;
         let tasks = TaskTracker::new();
         let connect_guard = |status: StatusCode| {
-            let mut g = new_guard(&access, &tasks, client, "CONNECT", target.authority());
+            let mut g = new_guard(
+                &access,
+                &tasks,
+                client,
+                direction,
+                "CONNECT",
+                target.authority(),
+            );
             g.set_status(status);
             g
         };
@@ -321,6 +330,7 @@ impl MitmInterceptor {
             tasks: tasks.clone(),
             shutdown: shutdown.clone(),
             client,
+            direction,
             default_authority,
             dialer,
         };
@@ -351,6 +361,7 @@ fn new_guard(
     access: &AccessLogger,
     tasks: &TaskTracker,
     client: SocketAddr,
+    direction: ProxyDirection,
     method: &str,
     target: String,
 ) -> AccessGuard {
@@ -359,6 +370,7 @@ fn new_guard(
         tasks.clone(),
         HttpAccessRecord {
             ts: OffsetDateTime::now_utc(),
+            direction,
             client,
             proto: "https".into(),
             mitm: true,
@@ -385,7 +397,14 @@ fn is_upgrade_request<B>(req: &Request<B>) -> bool {
 
 impl Session {
     fn guard(&self, method: &str, target: String) -> AccessGuard {
-        new_guard(&self.access, &self.tasks, self.client, method, target)
+        new_guard(
+            &self.access,
+            &self.tasks,
+            self.client,
+            self.direction,
+            method,
+            target,
+        )
     }
 
     /// `(authority, logged https:// URL)` for a decrypted request.

@@ -210,10 +210,34 @@ impl Logger {
 // Access records
 // ---------------------------------------------------------------------------
 
+/// Which proxy path handled a connection: forward (`ssh -D`) or reverse (`ssh -R`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum ProxyDirection {
+    #[default]
+    Forward,
+    Reverse,
+}
+
+impl ProxyDirection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Forward => "forward",
+            Self::Reverse => "reverse",
+        }
+    }
+}
+
+impl fmt::Display for ProxyDirection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// One HTTP/HTTPS access log entry (`kind=http`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpAccessRecord {
     pub ts: OffsetDateTime,
+    pub direction: ProxyDirection,
     pub client: SocketAddr,
     /// `http` or `https`.
     pub proto: String,
@@ -230,6 +254,7 @@ pub struct HttpAccessRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SocksLogRecord {
     pub ts: OffsetDateTime,
+    pub direction: ProxyDirection,
     pub client: SocketAddr,
     /// `socks4`, `socks4a`, or `socks5`.
     pub proto: String,
@@ -270,6 +295,7 @@ impl Fields for HttpAccessRecord {
         vec![
             ("ts", Value::Owned(format_timestamp(self.ts))),
             ("kind", Value::Str("http")),
+            ("direction", Value::Str(self.direction.as_str())),
             ("client", Value::Owned(self.client.to_string())),
             ("proto", Value::Str(&self.proto)),
             ("mitm", Value::Bool(self.mitm)),
@@ -288,6 +314,7 @@ impl Fields for SocksLogRecord {
         vec![
             ("ts", Value::Owned(format_timestamp(self.ts))),
             ("kind", Value::Str("socks")),
+            ("direction", Value::Str(self.direction.as_str())),
             ("client", Value::Owned(self.client.to_string())),
             ("proto", Value::Str(&self.proto)),
             ("cmd", Value::Str(&self.cmd)),
@@ -684,6 +711,7 @@ mod tests {
     fn http_record() -> HttpAccessRecord {
         HttpAccessRecord {
             ts: datetime!(2026-11-22 13:30:01.123456 UTC),
+            direction: ProxyDirection::Forward,
             client: "127.0.0.1:51234".parse().unwrap(),
             proto: "https".into(),
             mitm: true,
@@ -699,6 +727,7 @@ mod tests {
     fn socks_record() -> SocksLogRecord {
         SocksLogRecord {
             ts: datetime!(2026-11-22 13:30:02.456 UTC),
+            direction: ProxyDirection::Forward,
             client: "127.0.0.1:51240".parse().unwrap(),
             proto: "socks5".into(),
             cmd: "CONNECT".into(),
@@ -758,9 +787,9 @@ mod tests {
     fn http_record_text_format() {
         assert_eq!(
             http_record().format(LogFormat::Text),
-            "ts=2026-11-22T13:30:01.123Z kind=http client=127.0.0.1:51234 proto=https mitm=true \
-             method=GET target=https://example.com/api/v1 status=200 bytes_in=142 bytes_out=4096 \
-             duration_ms=84"
+            "ts=2026-11-22T13:30:01.123Z kind=http direction=forward client=127.0.0.1:51234 \
+             proto=https mitm=true method=GET target=https://example.com/api/v1 status=200 \
+             bytes_in=142 bytes_out=4096 duration_ms=84"
         );
     }
 
@@ -768,8 +797,8 @@ mod tests {
     fn socks_record_text_format() {
         assert_eq!(
             socks_record().format(LogFormat::Text),
-            "ts=2026-11-22T13:30:02.456Z kind=socks client=127.0.0.1:51240 proto=socks5 \
-             cmd=CONNECT target=github.com:22 status=ok bytes_in=1280 bytes_out=8192 \
+            "ts=2026-11-22T13:30:02.456Z kind=socks direction=forward client=127.0.0.1:51240 \
+             proto=socks5 cmd=CONNECT target=github.com:22 status=ok bytes_in=1280 bytes_out=8192 \
              duration_ms=1520"
         );
     }
@@ -794,8 +823,8 @@ mod tests {
         assert_eq!(
             v,
             serde_json::json!({
-                "ts": "2026-11-22T13:30:01.123Z", "kind": "http", "client": "127.0.0.1:51234",
-                "proto": "https", "mitm": true, "method": "GET",
+                "ts": "2026-11-22T13:30:01.123Z", "kind": "http", "direction": "forward",
+                "client": "127.0.0.1:51234", "proto": "https", "mitm": true, "method": "GET",
                 "target": "https://example.com/api/v1", "status": 200, "bytes_in": 142,
                 "bytes_out": 4096, "duration_ms": 84
             })
@@ -806,9 +835,10 @@ mod tests {
         assert_eq!(
             v,
             serde_json::json!({
-                "ts": "2026-11-22T13:30:02.456Z", "kind": "socks", "client": "127.0.0.1:51240",
-                "proto": "socks5", "cmd": "CONNECT", "target": "github.com:22", "status": "ok",
-                "bytes_in": 1280, "bytes_out": 8192, "duration_ms": 1520
+                "ts": "2026-11-22T13:30:02.456Z", "kind": "socks", "direction": "forward",
+                "client": "127.0.0.1:51240", "proto": "socks5", "cmd": "CONNECT",
+                "target": "github.com:22", "status": "ok", "bytes_in": 1280, "bytes_out": 8192,
+                "duration_ms": 1520
             })
         );
         assert!(

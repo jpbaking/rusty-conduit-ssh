@@ -1,11 +1,13 @@
 //! rusty-conduit-ssh: HTTP/HTTPS and SOCKS4/4a/5 proxy server routed through an SSH tunnel.
 
 pub mod config;
+pub mod filter;
 pub mod http;
 pub mod logging;
 pub mod mitm;
 pub mod mux;
 pub mod net;
+pub mod reverse;
 pub mod server;
 pub mod socks;
 pub mod ssh;
@@ -19,7 +21,8 @@ use config::{CliInput, Config};
 use http::HttpProxy;
 use logging::{AccessLogConfig, AccessLogger, LogLevel, Logger};
 use mitm::MitmState;
-use net::{Socks5UpstreamDialer, UpstreamDialer};
+use net::{FilteredDialer, Socks5UpstreamDialer, UpstreamDialer};
+use reverse::ReverseProxy;
 use server::{Connection, HandlerFuture, ProtocolHandlers, Server};
 use socks::SocksProxy;
 use ssh::{SshHandle, SshSupervisor, SshTunnelConfig};
@@ -80,15 +83,30 @@ pub fn log_startup(cfg: &Config, logger: &Logger) {
     }
 }
 
-/// Run with an already-validated configuration. Returns the process exit code.
-///
-/// Starts the SSH tunnel, serves until a signal arrives or the tunnel drops under
-/// `--no-reconnect`, then drains the server *before* stopping `ssh` so in-flight connections
-/// keep their tunnel. Must be called inside a Tokio runtime.
+/// Run with an already-validated configuration until a process signal arrives or the tunnel
+/// drops under `--no-reconnect`. Returns the process exit code. Must be called inside a Tokio
+/// runtime.
 pub async fn run(cfg: Config, logger: Logger) -> ExitCode {
+    let interrupted = CancellationToken::new();
+    let signal_token = interrupted.clone();
+    let signal_logger = logger.clone();
+    let signals = tokio::spawn(async move {
+        shutdown_signal(&signal_logger).await;
+        signal_token.cancel();
+    });
+    let code = run_until(cfg, logger, interrupted).await;
+    signals.abort();
+    code
+}
+
+/// Like [`run`], but shuts down when `interrupted` is cancelled instead of on process signals.
+///
+/// Shutdown order: drain the forward server while `ssh -D` is still up, stop `ssh` (ending
+/// `-R` forwarding), drain the reverse server, then flush the access logs.
+pub async fn run_until(cfg: Config, logger: Logger, interrupted: CancellationToken) -> ExitCode {
     log_startup(&cfg, &logger);
 
-    let tunnel_cfg = match SshTunnelConfig::from_config(&cfg) {
+    let mut tunnel_cfg = match SshTunnelConfig::from_config(&cfg) {
         Ok(c) => c,
         Err(e) => {
             logger.fatal(e);
@@ -115,19 +133,30 @@ pub async fn run(cfg: Config, logger: Logger) -> ExitCode {
         }
     };
 
+    // Bound before `ssh` starts so the `-R` targets are known and survive reconnects.
+    let reverse = match ReverseProxy::start(&cfg, &access, &logger).await {
+        Ok(reverse) => reverse,
+        Err(message) => {
+            logger.fatal(message);
+            if let Err(e) = access.shutdown().await {
+                logger.error(format!("failed to flush access logs: {e}"));
+            }
+            logger.flush();
+            return ExitCode::from(EXIT_FATAL);
+        }
+    };
+    if let Some(reverse) = &reverse {
+        tunnel_cfg.reverse_forwards = reverse.forwards().to_vec();
+    }
+
     // Deliberately separate tokens: a signal must not stop `ssh` until the server has drained,
     // so only the supervisor cancels `tunnel_lost`, and only signals cancel `interrupted`.
     let tunnel_lost = CancellationToken::new();
-    let interrupted = CancellationToken::new();
     let (ssh, tunnel_state) = SshSupervisor::spawn(tunnel_cfg, logger.clone(), tunnel_lost.clone());
-    let dialer: Arc<dyn UpstreamDialer> = Arc::new(Socks5UpstreamDialer::new(tunnel_state));
-
-    let signal_token = interrupted.clone();
-    let signal_logger = logger.clone();
-    let signals = tokio::spawn(async move {
-        shutdown_signal(&signal_logger).await;
-        signal_token.cancel();
-    });
+    let mut dialer: Arc<dyn UpstreamDialer> = Arc::new(Socks5UpstreamDialer::new(tunnel_state));
+    if let Some(filter) = cfg.forward_filter() {
+        dialer = Arc::new(FilteredDialer::new(dialer, Arc::new(filter)));
+    }
 
     let outcome = serve(
         &cfg,
@@ -139,8 +168,12 @@ pub async fn run(cfg: Config, logger: Logger) -> ExitCode {
         &interrupted,
     )
     .await;
-    signals.abort();
     ssh.shutdown().await;
+    if let Some(reverse) = reverse {
+        if reverse.shutdown().await.drained {
+            logger.debug("all reverse proxy connections drained");
+        }
+    }
 
     logger.info("shutting down");
     let mut code = ExitCode::SUCCESS;
@@ -168,8 +201,12 @@ async fn serve(
     interrupted: &CancellationToken,
 ) -> Result<(), String> {
     // Built before waiting so a bad CA fails without sitting through SSH authentication.
-    let mitm = MitmState::from_config(cfg, Arc::clone(&dialer))
-        .map_err(|e| format!("MITM setup failed: {e}"))?;
+    let mitm = if cfg.forward_enabled() {
+        MitmState::from_config(cfg, Arc::clone(&dialer))
+            .map_err(|e| format!("MITM setup failed: {e}"))?
+    } else {
+        None
+    };
     if let Some(m) = &mitm {
         m.cache.set_logger(logger.clone());
     }
@@ -180,6 +217,15 @@ async fn serve(
         ready = ssh.wait_ready(cfg.ssh_startup_timeout) => {
             ready.map_err(|e| e.to_string())?;
         }
+    }
+
+    // Reverse-only mode: no forward listeners, so just keep the tunnel up.
+    if !cfg.forward_enabled() {
+        tokio::select! {
+            () = interrupted.cancelled() => {}
+            () = tunnel_lost.cancelled() => {}
+        }
+        return Ok(());
     }
 
     let (http, socks) = build_engines(cfg, mitm.as_ref(), access, logger, dialer);

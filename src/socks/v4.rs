@@ -128,7 +128,11 @@ pub(super) async fn serve(proxy: &SocksProxy, mut conn: Connection) {
         }
     };
 
-    let mut session = Session::new(peer, if req.socks4a { "socks4a" } else { "socks4" });
+    let mut session = Session::new(
+        peer,
+        if req.socks4a { "socks4a" } else { "socks4" },
+        proxy.direction,
+    );
     session.cmd = cmd_label(req.cmd);
     session.target = req.target.to_string();
     logger.debug(format!(

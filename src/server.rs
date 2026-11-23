@@ -20,7 +20,7 @@
 use std::fmt;
 use std::future::Future;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -144,6 +144,19 @@ impl ListenPlan {
         Self::Separate {
             http: addr(cfg.http_port),
             socks: addr(cfg.socks_port),
+        }
+    }
+
+    /// Plan for the reverse proxy: ephemeral loopback ports, never reachable directly from
+    /// the network. They are bound once, so `ssh -R` targets stay stable across reconnects.
+    pub fn reverse_from_config(cfg: &Config) -> Self {
+        let ephemeral = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        if cfg.is_reverse_multiplexed() {
+            return Self::Multiplexed(ephemeral);
+        }
+        Self::Separate {
+            http: (cfg.reverse_http_port > 0).then_some(ephemeral),
+            socks: (cfg.reverse_socks_port > 0).then_some(ephemeral),
         }
     }
 }
@@ -466,7 +479,6 @@ async fn dispatch(
 mod tests {
     use super::*;
     use crate::logging::LogLevel;
-    use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Mutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -568,6 +580,42 @@ mod tests {
         assert_eq!(
             ListenPlan::from_config(&cfg),
             ListenPlan::Multiplexed(SocketAddr::new(cfg.bind, 8080))
+        );
+    }
+
+    #[test]
+    fn reverse_plan_uses_ephemeral_loopback() {
+        let ephemeral = loopback(0);
+        let plan = |reverse_http_port, reverse_socks_port| {
+            ListenPlan::reverse_from_config(&Config {
+                // The remote bind must never leak into the local listener address.
+                reverse_bind: "0.0.0.0".parse().unwrap(),
+                reverse_http_port,
+                reverse_socks_port,
+                ..Config::default()
+            })
+        };
+        assert_eq!(plan(8888, 8888), ListenPlan::Multiplexed(ephemeral));
+        assert_eq!(
+            plan(8888, 1081),
+            ListenPlan::Separate {
+                http: Some(ephemeral),
+                socks: Some(ephemeral),
+            }
+        );
+        assert_eq!(
+            plan(8888, 0),
+            ListenPlan::Separate {
+                http: Some(ephemeral),
+                socks: None,
+            }
+        );
+        assert_eq!(
+            plan(0, 1081),
+            ListenPlan::Separate {
+                http: None,
+                socks: Some(ephemeral),
+            }
         );
     }
 

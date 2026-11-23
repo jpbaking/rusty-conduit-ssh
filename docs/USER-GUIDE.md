@@ -34,7 +34,28 @@ Environment variable names below omit the `RUSTY_CONDUIT_SSH_` prefix. For examp
 | `--socks-port <PORT>` | `SOCKS_PORT` | `socks_port` | `1080` | SOCKS4/5 port, `0` disables |
 | `--max-connections <N>` | `MAX_CONNECTIONS` | `max_connections` | `4096` | Concurrent client cap, `0` = unlimited. Excess connections are closed immediately |
 
-At least one listener must be enabled. Setting both ports to the same non-zero value serves all protocols on that port.
+At least one forward or reverse listener must be enabled. Setting both ports to the same non-zero value serves all protocols on that port.
+
+### Reverse proxy
+
+| CLI flag | Env (after prefix) | TOML key | Default | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `--reverse-bind <IP>` | `REVERSE_BIND` | `reverse.bind` | `127.0.0.1` | Bind address on the SSH target for `ssh -R` |
+| `--reverse-http-port <PORT>` | `REVERSE_HTTP_PORT` | `reverse.http_port` | `0` | HTTP/HTTPS port on the SSH target, `0` disables |
+| `--reverse-socks-port <PORT>` | `REVERSE_SOCKS_PORT` | `reverse.socks_port` | `0` | SOCKS4/4a/5 port on the SSH target, `0` disables |
+| `--reverse-allow <RULE>` | `REVERSE_ALLOW` | `reverse.allow` | none | Reverse allowlist (IP, CIDR, FQDN, or `*.domain`); mutually exclusive with `--reverse-block` |
+| `--reverse-block <RULE>` | `REVERSE_BLOCK` | `reverse.block` | none | Reverse blocklist (IP, CIDR, FQDN, or `*.domain`); mutually exclusive with `--reverse-allow` |
+
+### Destination filtering (forward proxy)
+
+| CLI flag | Env (after prefix) | TOML key | Default | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `--allow <RULE>` | `ALLOW` | `allow` | none | Forward allowlist (IP, CIDR, FQDN, or `*.domain`); mutually exclusive with `--block` |
+| `--block <RULE>` | `BLOCK` | `block` | none | Forward blocklist (IP, CIDR, FQDN, or `*.domain`); mutually exclusive with `--allow` |
+
+CLI flags may be repeated or comma-separated (e.g. `--reverse-block 127.0.0.0/8,::1,*.internal`). Wildcards use a leading `*.` prefix and match subdomains only (`*.example.com` matches `api.example.com`, not bare `example.com`). Blocked requests return HTTP `403 Forbidden`, SOCKS5 `0x02` (`not_allowed`), or SOCKS4 `0x5B`. On the **reverse** path, hostnames are resolved locally before connecting so IP/CIDR rules also catch hostnames that resolve to blocked IPs (e.g. `localhost` → `127.0.0.1`). On the **forward** path, DNS remains remote-only, so FQDN rules match domain requests and IP/CIDR rules match literal IP requests.
+
+See [Reverse proxy](#8-reverse-proxy-ssh--r) for behavior and security guidance.
 
 ### SSH tunnel
 
@@ -78,7 +99,7 @@ At least one listener must be enabled. Setting both ports to the same non-zero v
 | `--http-access-log <PATH>` | `HTTP_ACCESS_LOG` | `logging.http_access_log` | none | HTTP/HTTPS access log file (append) |
 | `--socks-log <PATH>` | `SOCKS_LOG` | `logging.socks_log` | none | SOCKS connection log file (append) |
 
-Diagnostics go to `stderr`. At `DEBUG` and `VERBOSE`, access and SOCKS records are also written to `stdout`.
+Diagnostics go to `stderr`. At `DEBUG` and `VERBOSE`, access and SOCKS records are also written to `stdout`. Every HTTP and SOCKS record includes `direction=forward` (local → SSH target via `-D`) or `direction=reverse` (SSH target → local via `-R`).
 
 ---
 
@@ -110,6 +131,12 @@ reconnect_max_delay = "30s"
 startup_timeout = "30s"
 # extra_args = ["-C", "-o", "BatchMode=yes"]
 
+[reverse]
+# Ports on the SSH target. 0 disables; equal non-zero ports share one listener.
+bind = "127.0.0.1"
+http_port = 0
+socks_port = 0
+
 [mitm]
 # Use either ca_cert + ca_key, or ca_p12.
 # ca_cert = "/etc/rusty-conduit-ssh/ca.pem"
@@ -139,6 +166,7 @@ format = "text"
 ssh -N -T -4 -D 127.0.0.1:<port> \
     -o ExitOnForwardFailure=yes \
     -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+    [-R REMOTE_IP:REMOTE_PORT:127.0.0.1:LOCAL_PORT ...] \
     [-p PORT] [-i IDENTITY] [-F CONFIG] [-J JUMP] [extra args] -- TARGET
 ```
 
@@ -200,7 +228,7 @@ Very low values can cause false disconnects on lossy links.
 
 **`--no-reconnect`.** The process exits when the tunnel drops. It exits with code `1` if the tunnel never became ready, and `0` if it drops after startup, following an orderly drain.
 
-**Shutdown.** `Ctrl+C` or `SIGTERM` stops new connections and drains active ones for up to 5 seconds. `ssh` then receives `SIGTERM` and is killed if it has not exited within 3 seconds.
+**Shutdown.** `Ctrl+C` or `SIGTERM` stops new connections and drains active ones for up to 5 seconds. `ssh` then receives `SIGTERM` and is killed if it has not exited within 3 seconds. If the reverse proxy is enabled, it drains for up to 5 more seconds after `ssh` stops.
 
 **Exit codes:** `0` for a clean exit, `1` for a fatal startup or runtime error, and `2` for a command-line usage error.
 
@@ -266,9 +294,62 @@ The CA is checked at startup, before SSH authentication. An unparsable or expire
 
 ---
 
-## 8. Security checklist
+## 8. Reverse proxy (`ssh -R`)
+
+The reverse proxy is **off** until you set a reverse port. It lets clients on the SSH target egress through the machine running `rusty-conduit-ssh`, over the same supervised SSH connection as the forward proxy.
+
+```text
+client on SSH target -> sshd:REMOTE_PORT -> ssh -R -> local reverse listener -> internet
+```
+
+### Choosing ports
+
+| `reverse_http_port` | `reverse_socks_port` | Result |
+| :--- | :--- | :--- |
+| `0` | `0` | Disabled, no `-R` argument |
+| `8888` | `8888` | One multiplexed listener and one `-R` |
+| `8888` | `1081` | Two listeners and two `-R` arguments |
+| `8888` | `0` | HTTP/HTTPS only |
+| `0` | `1081` | SOCKS4/4a/5 only |
+
+```sh
+# Forward and reverse proxies together
+rusty-conduit-ssh my-bastion --reverse-http-port 8888 --reverse-socks-port 1081
+
+# Reverse only. ssh -D still runs, because it is the tunnel readiness check
+rusty-conduit-ssh my-bastion --http-port 0 --socks-port 0 \
+  --reverse-http-port 8888 --reverse-socks-port 8888
+```
+
+On the SSH target:
+
+```sh
+curl -x http://127.0.0.1:8888 https://example.com/
+curl --socks5-hostname 127.0.0.1:8888 https://example.com/
+```
+
+### How it behaves
+
+- **Egress and DNS are local.** Reverse connections dial directly from your machine and use its resolver, so hostnames are resolved there rather than on the SSH target.
+- **Local ports stay stable.** The ephemeral loopback listeners are bound once at startup and reused by every reconnect.
+- **Remote bind failures are retried.** With `ExitOnForwardFailure=yes`, `ssh` exits if the remote port is taken, and the supervisor retries with backoff. After an abrupt disconnect, sshd may hold the old port until it notices the dead session, so setting `ClientAliveInterval` on the server shortens that window.
+- **`--max-connections` applies separately** to the forward and reverse proxies, so one side cannot exhaust the other.
+- **MITM applies to both directions** when a CA is configured. The reverse proxy has its own certificate cache and dials directly.
+- **Logs are shared.** Reverse connections go to the same access and SOCKS logs as forward connections.
+
+### Security
+
+The reverse proxy has **no authentication**, and it connects from your machine. Anyone who can reach its remote port can reach what your machine can reach, including `127.0.0.1` services and your LAN.
+
+- Keep `--reverse-bind` on loopback, and use the reverse proxy only on SSH targets whose local users you trust.
+- A non-loopback `--reverse-bind` logs a security notice. It also requires `GatewayPorts clientspecified` or `yes` in the server's `sshd_config`. Without that, sshd may bind loopback instead.
+
+---
+
+## 9. Security checklist
 
 - Keep `--bind` on loopback unless a firewall restricts access. v1 has **no proxy authentication**, and a non-loopback bind logs a security notice at startup.
+- Keep `--reverse-bind` on loopback. The reverse proxy gives its clients access to whatever your machine can reach, including its loopback services.
 - Keep `--ssh-socks-bind` on loopback. The `ssh -D` listener is also unauthenticated and reaches everything the SSH target can reach.
 - Prefer `RUSTY_CONDUIT_SSH_MITM_CA_PASSPHRASE` or `--mitm-ca-passphrase-file` over `--mitm-ca-passphrase`, which is visible in process listings and shell history.
 - Keep `--max-connections` bounded on shared hosts.

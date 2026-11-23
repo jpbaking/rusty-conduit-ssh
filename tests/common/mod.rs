@@ -800,6 +800,12 @@ pub struct MockSsh {
 #[cfg(unix)]
 impl MockSsh {
     pub fn new() -> Self {
+        Self::with_term_delay("0")
+    }
+
+    /// Like [`Self::new`], but after recording `SIGTERM` the mock stays alive for
+    /// `seconds`, which exposes what is still running while `ssh` terminates.
+    pub fn with_term_delay(seconds: &str) -> Self {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = temp_dir("mock-ssh");
@@ -807,7 +813,7 @@ impl MockSsh {
         let script = format!(
             "#!/bin/sh\n\
              [ \"$1\" = \"--probe\" ] && exit 0\n\
-             trap 'echo term >> \"{d}/terms\"; exit 0' TERM\n\
+             trap 'echo term >> \"{d}/terms\"; sleep {seconds}; exit 0' TERM\n\
              printf '%s\\n' \"$@\" > '{d}/args'\n\
              echo \"$$\" >> '{d}/pids'\n\
              while :; do sleep 0.05; done\n"
