@@ -30,6 +30,85 @@ const ATYP_IPV4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x03;
 const ATYP_IPV6: u8 = 0x04;
 
+/// TCP keepalive parameters applied to client sockets and direct upstream sockets.
+///
+/// Probes are sent by the OS kernel only while a connection is completely idle; they carry no
+/// payload and are invisible to HTTP, TLS, SOCKS, and any tunneled protocol. They keep NAT /
+/// firewall / VPN state alive during long silent periods and let dead peers be detected after
+/// roughly `idle + interval * retries`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeepaliveSettings {
+    /// Idle time before the first probe is sent.
+    pub idle: Duration,
+    /// Time between unanswered probes.
+    pub interval: Duration,
+    /// Unanswered probes before the OS closes the connection.
+    pub retries: u32,
+}
+
+impl KeepaliveSettings {
+    /// Default: first probe after 60s idle, then every 10s, give up after 5 misses.
+    pub const DEFAULT: Self = Self {
+        idle: Duration::from_secs(60),
+        interval: Duration::from_secs(10),
+        retries: 5,
+    };
+
+    /// Enable `SO_KEEPALIVE` on `stream` with these parameters. On platforms without
+    /// per-socket interval / retry control only the idle time is applied.
+    pub fn apply(&self, stream: &TcpStream) -> io::Result<()> {
+        let params = socket2::TcpKeepalive::new().with_time(self.idle);
+        #[cfg(any(
+            target_os = "android",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "fuchsia",
+            target_os = "illumos",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "netbsd",
+            target_os = "windows",
+        ))]
+        let params = params
+            .with_interval(self.interval)
+            .with_retries(self.retries);
+        socket2::SockRef::from(stream).set_tcp_keepalive(&params)
+    }
+}
+
+impl Default for KeepaliveSettings {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+impl std::fmt::Display for KeepaliveSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "idle={} interval={} retries={}",
+            humantime::format_duration(self.idle),
+            humantime::format_duration(self.interval),
+            self.retries
+        )
+    }
+}
+
+/// Configure a freshly dialed upstream socket: `TCP_NODELAY` plus optional keepalive.
+///
+/// A keepalive failure is not fatal: the connection still works, it just will not probe.
+fn prepare_upstream(
+    stream: TcpStream,
+    keepalive: Option<&KeepaliveSettings>,
+) -> io::Result<TcpStream> {
+    stream.set_nodelay(true)?;
+    if let Some(ka) = keepalive {
+        let _ = ka.apply(&stream);
+    }
+    Ok(stream)
+}
+
 /// Live state of the SSH dynamic tunnel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TunnelState {
@@ -56,10 +135,12 @@ pub trait UpstreamDialer: Send + Sync {
 ///
 /// Used for reverse proxy egress, where routing through [`Socks5UpstreamDialer`] would loop
 /// traffic back to the SSH target, and by isolated tests. When a [`HostFilter`] is attached,
-/// both domain names and resolved IP addresses are checked before connecting.
+/// both domain names and resolved IP addresses are checked before connecting. TCP keepalive
+/// is off unless set with [`DirectDialer::with_tcp_keepalive`].
 #[derive(Debug, Clone, Default)]
 pub struct DirectDialer {
     filter: Option<Arc<HostFilter>>,
+    keepalive: Option<KeepaliveSettings>,
 }
 
 impl DirectDialer {
@@ -67,7 +148,14 @@ impl DirectDialer {
     pub fn with_filter(filter: Arc<HostFilter>) -> Self {
         Self {
             filter: Some(filter),
+            keepalive: None,
         }
+    }
+
+    /// Set TCP keepalive for upstream sockets (`None` disables).
+    pub fn with_tcp_keepalive(mut self, keepalive: Option<KeepaliveSettings>) -> Self {
+        self.keepalive = keepalive;
+        self
     }
 }
 
@@ -75,14 +163,15 @@ impl UpstreamDialer for DirectDialer {
     fn connect(&self, host: &str, port: u16, timeout: Duration) -> DialFuture<'_> {
         let host = strip_brackets(host).to_owned();
         let filter = self.filter.clone();
+        let keepalive = self.keepalive;
         Box::pin(async move {
+            let keepalive = keepalive.as_ref();
             let Some(filter) = filter else {
                 let stream =
                     tokio::time::timeout(timeout, TcpStream::connect((host.as_str(), port)))
                         .await
                         .map_err(|_| timed_out(&host, port, timeout))??;
-                stream.set_nodelay(true)?;
-                return Ok(stream);
+                return prepare_upstream(stream, keepalive);
             };
 
             let deadline = Instant::now() + timeout;
@@ -93,8 +182,7 @@ impl UpstreamDialer for DirectDialer {
                     tokio::time::timeout(remaining, TcpStream::connect(SocketAddr::new(ip, port)))
                         .await
                         .map_err(|_| timed_out(&host, port, timeout))??;
-                stream.set_nodelay(true)?;
-                return Ok(stream);
+                return prepare_upstream(stream, keepalive);
             }
 
             let domain = normalize_domain(&host);
@@ -158,10 +246,7 @@ impl UpstreamDialer for DirectDialer {
                     return Err(timed_out(&host, port, timeout));
                 }
                 match tokio::time::timeout(remaining, TcpStream::connect(addr)).await {
-                    Ok(Ok(stream)) => {
-                        stream.set_nodelay(true)?;
-                        return Ok(stream);
-                    }
+                    Ok(Ok(stream)) => return prepare_upstream(stream, keepalive),
                     Ok(Err(e)) => last_err = Some(e),
                     Err(_) => return Err(timed_out(&host, port, timeout)),
                 }
@@ -378,6 +463,7 @@ fn invalid_data(message: String) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::filter::FilterRule;
     use tokio::net::TcpListener;
     use tokio::task::JoinHandle;
 
@@ -590,5 +676,62 @@ mod tests {
         assert_eq!(relay.await.unwrap(), (1234, 2500));
         assert_eq!(upstream_task.await.unwrap(), vec![b'q'; 1234]);
         assert_eq!(reply, vec![b'r'; 2500]);
+    }
+
+    fn assert_keepalive(stream: &TcpStream, ka: &KeepaliveSettings) {
+        let sock = socket2::SockRef::from(stream);
+        assert!(sock.keepalive().unwrap());
+        assert!(stream.nodelay().unwrap());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            assert_eq!(sock.tcp_keepalive_time().unwrap(), ka.idle);
+            assert_eq!(sock.tcp_keepalive_interval().unwrap(), ka.interval);
+            assert_eq!(sock.tcp_keepalive_retries().unwrap(), ka.retries);
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_dialer_applies_keepalive_settings() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move {
+            for _ in 0..3 {
+                listener.accept().await.unwrap();
+            }
+        });
+        let ka = KeepaliveSettings {
+            idle: Duration::from_secs(45),
+            interval: Duration::from_secs(7),
+            retries: 4,
+        };
+        let block_other: FilterRule = "203.0.113.0/24".parse().unwrap();
+        let filter = Arc::new(HostFilter::Block(vec![block_other]));
+        let dialers = [
+            DirectDialer::default().with_tcp_keepalive(Some(ka)),
+            DirectDialer::with_filter(Arc::clone(&filter)).with_tcp_keepalive(Some(ka)),
+        ];
+        // Unfiltered, filtered IP literal, and filtered hostname dial paths.
+        for (dialer, host) in [
+            (&dialers[0], "127.0.0.1"),
+            (&dialers[1], "127.0.0.1"),
+            (&dialers[1], "localhost"),
+        ] {
+            let stream = dialer.connect(host, port, T).await.unwrap();
+            assert_keepalive(&stream, &ka);
+        }
+        accept.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_dialer_without_keepalive_leaves_it_off() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move { listener.accept().await });
+        let stream = DirectDialer::default()
+            .connect("127.0.0.1", port, T)
+            .await
+            .unwrap();
+        assert!(!socket2::SockRef::from(&stream).keepalive().unwrap());
+        accept.await.unwrap().unwrap();
     }
 }

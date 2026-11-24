@@ -42,10 +42,12 @@ impl ReverseProxy {
             return Ok(None);
         }
 
-        let dialer: Arc<dyn UpstreamDialer> = match cfg.reverse_filter() {
-            Some(filter) => Arc::new(DirectDialer::with_filter(Arc::new(filter))),
-            None => Arc::new(DirectDialer::default()),
+        let keepalive = cfg.tcp_keepalive_settings();
+        let direct = match cfg.reverse_filter() {
+            Some(filter) => DirectDialer::with_filter(Arc::new(filter)),
+            None => DirectDialer::default(),
         };
+        let dialer: Arc<dyn UpstreamDialer> = Arc::new(direct.with_tcp_keepalive(keepalive));
         let mitm = MitmState::from_config(cfg, Arc::clone(&dialer))
             .map_err(|e| format!("reverse proxy MITM setup failed: {e}"))?;
         if let Some(m) = &mitm {
@@ -63,7 +65,8 @@ impl ReverseProxy {
         )
         .await
         .map_err(|e| format!("reverse proxy: {e}"))?
-        .with_max_connections(cfg.reverse_max_connections);
+        .with_max_connections(cfg.reverse_max_connections)
+        .with_tcp_keepalive(keepalive);
 
         let mut forwards = Vec::new();
         for (role, local) in server.listeners() {

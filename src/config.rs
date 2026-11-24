@@ -24,6 +24,7 @@ use serde::Deserialize;
 
 use crate::filter::{FilterRule, HostFilter};
 use crate::logging::{LogFormat, LogLevel};
+use crate::net::KeepaliveSettings;
 
 /// Default bind address.
 pub const DEFAULT_BIND: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -39,6 +40,10 @@ pub const DEFAULT_MITM_CERT_TTL: Duration = Duration::from_secs(60 * 60);
 pub const MIN_MITM_CERT_TTL: Duration = Duration::from_secs(10);
 /// Default cap on concurrent client connections (`0` = unlimited).
 pub const DEFAULT_MAX_CONNECTIONS: usize = 4096;
+/// Largest accepted TCP keepalive idle time / probe interval (Linux caps both at 32767s).
+pub const MAX_TCP_KEEPALIVE_DURATION: Duration = Duration::from_secs(32_767);
+/// Largest accepted TCP keepalive probe count (Linux caps `TCP_KEEPCNT` at 127).
+pub const MAX_TCP_KEEPALIVE_RETRIES: u32 = 127;
 /// Default cap on cached MITM leaf certificates (`0` = unlimited).
 pub const DEFAULT_MITM_CERT_CACHE_MAX_ENTRIES: usize = 10_000;
 /// Default `ssh` executable.
@@ -176,6 +181,8 @@ pub enum ConfigError {
         humantime::format_duration(*.max)
     )]
     ReconnectDelayOrder { initial: Duration, max: Duration },
+    #[error("invalid TCP keepalive setting: {0}")]
+    InvalidKeepalive(String),
     #[error("conflicting {scope} filter: cannot set both allowlist and blocklist")]
     ConflictingFilter { scope: &'static str },
 }
@@ -221,6 +228,32 @@ pub struct CliArgs {
     /// Maximum concurrent client connections; excess connections are closed immediately, 0 = unlimited [default: 4096]
     #[arg(long, value_name = "N", env = "RUSTY_CONDUIT_SSH_MAX_CONNECTIONS")]
     pub max_connections: Option<usize>,
+
+    /// Idle time before TCP keepalive probes start on forward and reverse client and upstream sockets, 0 = disabled [default: 60s]
+    #[arg(
+        long,
+        value_name = "DURATION",
+        env = "RUSTY_CONDUIT_SSH_TCP_KEEPALIVE",
+        value_parser = humantime::parse_duration
+    )]
+    pub tcp_keepalive: Option<Duration>,
+
+    /// Time between unanswered TCP keepalive probes [default: 10s]
+    #[arg(
+        long,
+        value_name = "DURATION",
+        env = "RUSTY_CONDUIT_SSH_TCP_KEEPALIVE_INTERVAL",
+        value_parser = humantime::parse_duration
+    )]
+    pub tcp_keepalive_interval: Option<Duration>,
+
+    /// Unanswered TCP keepalive probes before the connection is closed [default: 5]
+    #[arg(
+        long,
+        value_name = "N",
+        env = "RUSTY_CONDUIT_SSH_TCP_KEEPALIVE_RETRIES"
+    )]
+    pub tcp_keepalive_retries: Option<u32>,
 
     /// Allowlist of destinations for the forward proxy (IP, CIDR, FQDN, or *.domain); repeatable or comma-separated
     #[arg(
@@ -529,6 +562,11 @@ pub struct FileConfig {
     pub http_port: Option<u16>,
     pub socks_port: Option<u16>,
     pub max_connections: Option<usize>,
+    /// Human-readable duration such as `60s` or `2m`; `"0"` disables keepalive.
+    pub tcp_keepalive: Option<String>,
+    /// Human-readable duration such as `10s`.
+    pub tcp_keepalive_interval: Option<String>,
+    pub tcp_keepalive_retries: Option<u32>,
     pub allow: Option<Vec<String>>,
     pub block: Option<Vec<String>>,
     #[serde(default)]
@@ -669,6 +707,13 @@ pub struct Config {
     pub socks_port: u16,
     /// Maximum concurrent client connections (`0` = unlimited).
     pub max_connections: usize,
+    /// Idle time before TCP keepalive probes start (`0` = keepalive disabled). Applies to
+    /// both the forward and reverse proxies.
+    pub tcp_keepalive: Duration,
+    /// Time between unanswered TCP keepalive probes.
+    pub tcp_keepalive_interval: Duration,
+    /// Unanswered TCP keepalive probes before the OS closes the connection.
+    pub tcp_keepalive_retries: u32,
     /// Forward proxy destination allowlist (mutually exclusive with `block`).
     pub allow: Vec<FilterRule>,
     /// Forward proxy destination blocklist (mutually exclusive with `allow`).
@@ -730,6 +775,9 @@ impl fmt::Debug for Config {
             .field("http_port", &self.http_port)
             .field("socks_port", &self.socks_port)
             .field("max_connections", &self.max_connections)
+            .field("tcp_keepalive", &self.tcp_keepalive)
+            .field("tcp_keepalive_interval", &self.tcp_keepalive_interval)
+            .field("tcp_keepalive_retries", &self.tcp_keepalive_retries)
             .field("reverse_bind", &self.reverse_bind)
             .field("reverse_http_port", &self.reverse_http_port)
             .field("reverse_socks_port", &self.reverse_socks_port)
@@ -787,6 +835,9 @@ impl Default for Config {
             http_port: DEFAULT_HTTP_PORT,
             socks_port: DEFAULT_SOCKS_PORT,
             max_connections: DEFAULT_MAX_CONNECTIONS,
+            tcp_keepalive: KeepaliveSettings::DEFAULT.idle,
+            tcp_keepalive_interval: KeepaliveSettings::DEFAULT.interval,
+            tcp_keepalive_retries: KeepaliveSettings::DEFAULT.retries,
             allow: Vec::new(),
             block: Vec::new(),
             reverse_bind: DEFAULT_REVERSE_BIND,
@@ -903,6 +954,11 @@ impl Config {
         )?;
         let file_startup =
             file_duration("ssh.startup_timeout", file.ssh.startup_timeout.as_deref())?;
+        let file_keepalive = file_duration("tcp_keepalive", file.tcp_keepalive.as_deref())?;
+        let file_keepalive_interval = file_duration(
+            "tcp_keepalive_interval",
+            file.tcp_keepalive_interval.as_deref(),
+        )?;
         let no_reconnect = if cli.no_reconnect_explicit {
             a.no_reconnect
         } else {
@@ -949,6 +1005,18 @@ impl Config {
             http_port: a.http_port.or(file.http_port).unwrap_or(d.http_port),
             socks_port: a.socks_port.or(file.socks_port).unwrap_or(d.socks_port),
             max_connections,
+            tcp_keepalive: a
+                .tcp_keepalive
+                .or(file_keepalive)
+                .unwrap_or(d.tcp_keepalive),
+            tcp_keepalive_interval: a
+                .tcp_keepalive_interval
+                .or(file_keepalive_interval)
+                .unwrap_or(d.tcp_keepalive_interval),
+            tcp_keepalive_retries: a
+                .tcp_keepalive_retries
+                .or(file.tcp_keepalive_retries)
+                .unwrap_or(d.tcp_keepalive_retries),
             allow,
             block,
             reverse_bind: a
@@ -1057,6 +1125,30 @@ impl Config {
                 initial: self.reconnect_initial_delay,
                 max: self.reconnect_max_delay,
             });
+        }
+        if !self.tcp_keepalive.is_zero() {
+            let secs = Duration::from_secs(1)..=MAX_TCP_KEEPALIVE_DURATION;
+            let fmt = |d: Duration| humantime::format_duration(d).to_string();
+            if !secs.contains(&self.tcp_keepalive) {
+                return Err(ConfigError::InvalidKeepalive(format!(
+                    "--tcp-keepalive must be 0 (disabled) or between 1s and {}s (got {})",
+                    MAX_TCP_KEEPALIVE_DURATION.as_secs(),
+                    fmt(self.tcp_keepalive)
+                )));
+            }
+            if !secs.contains(&self.tcp_keepalive_interval) {
+                return Err(ConfigError::InvalidKeepalive(format!(
+                    "--tcp-keepalive-interval must be between 1s and {}s (got {})",
+                    MAX_TCP_KEEPALIVE_DURATION.as_secs(),
+                    fmt(self.tcp_keepalive_interval)
+                )));
+            }
+            if !(1..=MAX_TCP_KEEPALIVE_RETRIES).contains(&self.tcp_keepalive_retries) {
+                return Err(ConfigError::InvalidKeepalive(format!(
+                    "--tcp-keepalive-retries must be between 1 and {MAX_TCP_KEEPALIVE_RETRIES} (got {})",
+                    self.tcp_keepalive_retries
+                )));
+            }
         }
         if !self.allow.is_empty() && !self.block.is_empty() {
             return Err(ConfigError::ConflictingFilter { scope: "forward" });
@@ -1196,6 +1288,15 @@ impl Config {
         out
     }
 
+    /// The configured TCP keepalive parameters, or `None` when keepalive is disabled.
+    pub fn tcp_keepalive_settings(&self) -> Option<KeepaliveSettings> {
+        (!self.tcp_keepalive.is_zero()).then_some(KeepaliveSettings {
+            idle: self.tcp_keepalive,
+            interval: self.tcp_keepalive_interval,
+            retries: self.tcp_keepalive_retries,
+        })
+    }
+
     /// One-line configuration summary for the startup banner (never includes secrets).
     pub fn summary(&self) -> String {
         fn port(p: u16) -> String {
@@ -1222,6 +1323,15 @@ impl Config {
             Some(CaSource::Pkcs12 { .. }) => "on(pkcs12)",
             None => "off",
         };
+        let keepalive = match self.tcp_keepalive_settings() {
+            Some(ka) => format!(
+                "{}/{}x{}",
+                humantime::format_duration(ka.idle),
+                humantime::format_duration(ka.interval),
+                ka.retries
+            ),
+            None => "off".to_string(),
+        };
         let filter = self
             .forward_filter()
             .map(|f| format!(" filter={}({})", f.mode_str(), f.len()))
@@ -1244,7 +1354,7 @@ impl Config {
             String::new()
         };
         format!(
-            "bind={} http_port={} socks_port={} multiplexed={} max_connections={} mitm={} \
+            "bind={} http_port={} socks_port={} multiplexed={} max_connections={} tcp_keepalive={keepalive} mitm={} \
              mitm_cert_ttl={} mitm_cert_cache_max_entries={} socks_block_web_in_mitm={} log_level={} log_format={} http_access_log={} socks_log={} \
              config={} ssh_target={} ssh_bin={} ssh_socks_bind={} ssh_socks_port={} \
              ssh_ip_version={} ssh_server_alive_interval={} ssh_server_alive_count_max={} \
@@ -1299,6 +1409,9 @@ mod tests {
         "RUSTY_CONDUIT_SSH_HTTP_PORT",
         "RUSTY_CONDUIT_SSH_SOCKS_PORT",
         "RUSTY_CONDUIT_SSH_MAX_CONNECTIONS",
+        "RUSTY_CONDUIT_SSH_TCP_KEEPALIVE",
+        "RUSTY_CONDUIT_SSH_TCP_KEEPALIVE_INTERVAL",
+        "RUSTY_CONDUIT_SSH_TCP_KEEPALIVE_RETRIES",
         "RUSTY_CONDUIT_SSH_ALLOW",
         "RUSTY_CONDUIT_SSH_BLOCK",
         "RUSTY_CONDUIT_SSH_REVERSE_BIND",
@@ -2519,5 +2632,96 @@ block = ["127.0.0.0/8", "::1"]
             Err(ConfigError::ConflictingFilter { scope: "forward" })
         ));
         let _ = fs::remove_file(&toml_path);
+    }
+
+    // ---- TCP keepalive ----
+
+    #[test]
+    fn keepalive_defaults() {
+        let _env = EnvGuard::new(&[]);
+        let cfg = load(&[]).unwrap();
+        assert_eq!(
+            cfg.tcp_keepalive_settings(),
+            Some(KeepaliveSettings::DEFAULT)
+        );
+        assert_eq!(KeepaliveSettings::DEFAULT.idle, Duration::from_secs(60));
+        assert_eq!(KeepaliveSettings::DEFAULT.interval, Duration::from_secs(10));
+        assert_eq!(KeepaliveSettings::DEFAULT.retries, 5);
+        let s = cfg.summary();
+        assert!(s.contains("tcp_keepalive=1m/10sx5"), "{s}");
+    }
+
+    #[test]
+    fn keepalive_precedence_cli_over_env_over_toml() {
+        let path = temp_file(
+            "tcp_keepalive = \"2m\"\ntcp_keepalive_interval = \"20s\"\ntcp_keepalive_retries = 3\n",
+        );
+        let p = path.to_str().unwrap();
+
+        let _env = EnvGuard::new(&[]);
+        let cfg = load(&["--config", p]).unwrap();
+        assert_eq!(
+            cfg.tcp_keepalive_settings(),
+            Some(KeepaliveSettings {
+                idle: Duration::from_secs(120),
+                interval: Duration::from_secs(20),
+                retries: 3,
+            })
+        );
+        drop(_env);
+
+        let _env = EnvGuard::new(&[
+            ("RUSTY_CONDUIT_SSH_TCP_KEEPALIVE", "90s"),
+            ("RUSTY_CONDUIT_SSH_TCP_KEEPALIVE_RETRIES", "7"),
+        ]);
+        let cfg = load(&["--config", p, "--tcp-keepalive-retries", "9"]).unwrap();
+        assert_eq!(cfg.tcp_keepalive, Duration::from_secs(90));
+        assert_eq!(cfg.tcp_keepalive_interval, Duration::from_secs(20));
+        assert_eq!(cfg.tcp_keepalive_retries, 9);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn keepalive_zero_disables() {
+        let _env = EnvGuard::new(&[]);
+        let cfg = load(&["--tcp-keepalive", "0"]).unwrap();
+        assert_eq!(cfg.tcp_keepalive_settings(), None);
+        assert!(cfg.summary().contains("tcp_keepalive=off"));
+        // Interval / retries are not validated while keepalive is off.
+        let cfg = load(&["--tcp-keepalive", "0", "--tcp-keepalive-retries", "0"]).unwrap();
+        assert_eq!(cfg.tcp_keepalive_settings(), None);
+
+        let path = temp_file("tcp_keepalive = \"0s\"\n");
+        let cfg = load(&["--config", path.to_str().unwrap()]).unwrap();
+        assert_eq!(cfg.tcp_keepalive_settings(), None);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn fatal_invalid_keepalive() {
+        let _env = EnvGuard::new(&[]);
+        for args in [
+            &["--tcp-keepalive", "500ms"][..],
+            &["--tcp-keepalive", "10h"][..],
+            &["--tcp-keepalive-interval", "0s"][..],
+            &["--tcp-keepalive-retries", "0"][..],
+            &["--tcp-keepalive-retries", "128"][..],
+        ] {
+            let err = load(args).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::InvalidKeepalive(_)),
+                "{args:?}: {err}"
+            );
+        }
+        let path = temp_file("tcp_keepalive = \"soon\"\n");
+        let err = load(&["--config", path.to_str().unwrap()]).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::InvalidFileValue {
+                key: "tcp_keepalive",
+                ..
+            }
+        ));
+        let _ = fs::remove_file(&path);
     }
 }

@@ -33,6 +33,9 @@ Environment variable names below omit the `RUSTY_CONDUIT_SSH_` prefix. For examp
 | `--http-port <PORT>` | `HTTP_PORT` | `http_port` | `3128` | HTTP/HTTPS port, `0` disables |
 | `--socks-port <PORT>` | `SOCKS_PORT` | `socks_port` | `1080` | SOCKS4/5 port, `0` disables |
 | `--max-connections <N>` | `MAX_CONNECTIONS` | `max_connections` | `4096` | Concurrent forward proxy clients, HTTP and SOCKS combined, `0` = unlimited. Excess connections are closed immediately. Also the reverse cap unless `--reverse-max-connections` is set |
+| `--tcp-keepalive <DURATION>` | `TCP_KEEPALIVE` | `tcp_keepalive` | `60s` | Idle time before TCP keepalive probes start, on forward and reverse client sockets and reverse upstream sockets. `0` disables; otherwise `1s` to `32767s` |
+| `--tcp-keepalive-interval <DURATION>` | `TCP_KEEPALIVE_INTERVAL` | `tcp_keepalive_interval` | `10s` | Time between unanswered keepalive probes, `1s` to `32767s` |
+| `--tcp-keepalive-retries <N>` | `TCP_KEEPALIVE_RETRIES` | `tcp_keepalive_retries` | `5` | Unanswered probes before the OS closes the connection, `1` to `127` |
 
 At least one forward or reverse listener must be enabled. Setting both ports to the same non-zero value serves all protocols on that port.
 
@@ -113,6 +116,9 @@ bind = "127.0.0.1"
 http_port = 3128
 socks_port = 1080
 max_connections = 4096
+tcp_keepalive = "60s"          # "0" disables
+tcp_keepalive_interval = "10s"
+tcp_keepalive_retries = 5
 
 [ssh]
 target = "my-bastion"
@@ -216,6 +222,23 @@ rusty-conduit-ssh my-bastion \
 ```
 
 Very low values can cause false disconnects on lossy links.
+
+**Long silent connections.** Once a tunnel, SOCKS relay, or HTTP connection is established, no idle or total-lifetime timeout applies. A connection stays open for as long as both peers keep it open, however long it is silent. NAT gateways, firewalls, VPNs, Docker or Kubernetes conntrack, and cloud load balancers can still expire idle flows outside the proxy, often without telling either end. Long-polling clients, such as AI agents waiting on a model response, are the usual victims.
+
+To keep that state alive, OS-level TCP keepalive is enabled on each hop that rusty-conduit-ssh owns, in both directions. The first probe goes out after `60s` idle, then every `10s`, and the connection is closed after `5` unanswered probes, about 110 seconds after the peer vanishes. Tune it with `--tcp-keepalive`, `--tcp-keepalive-interval`, and `--tcp-keepalive-retries`, or turn it off with `--tcp-keepalive 0`.
+
+| Hop | Kept alive by |
+| :--- | :--- |
+| Forward client ↔ forward listener | TCP keepalive |
+| Your machine ↔ SSH target (the `ssh` session itself) | `ServerAliveInterval`, as above. This carries both forward and reverse traffic |
+| SSH target ↔ forward destination | sshd. rusty-conduit-ssh does not control this socket |
+| Reverse client ↔ sshd on the SSH target | sshd. Set `ClientAliveInterval` or `TCPKeepAlive` in `sshd_config` |
+| Reverse listener ↔ reverse destination (direct egress from your machine) | TCP keepalive |
+
+- Probes are empty TCP segments handled by the kernel. They are invisible to HTTP, TLS, SOCKS, and any tunneled protocol, and cost about 60 bytes per idle interval.
+- Probes keep a single hop alive. They are not forwarded end to end, and they cannot save a connection whose path is broken.
+- For SSH through the proxy, also set `ServerAliveInterval` (for example `30`) in `~/.ssh/config` for that inner session. It works end to end inside the encrypted session.
+- On platforms without per-socket interval and retry control, only the idle time is applied.
 
 **Backoff.** After a drop, the delay starts at `--reconnect-initial-delay` and doubles up to `--reconnect-max-delay` (by default 1s, 2s, 4s, and so on up to 30s). It resets once a tunnel has become ready.
 

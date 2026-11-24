@@ -15,6 +15,7 @@
 - **No local DNS lookups for proxied hosts:** Hostnames are handed to the tunnel as names and resolved on the SSH target.
 - **Optional reverse proxy (`ssh -R`):** The same process and SSH connection can also expose an HTTP/HTTPS and SOCKS proxy on the SSH target, so clients there egress through your machine.
 - **Opt-in HTTPS MITM:** Off by default and never auto-generates a CA. Bring a PEM or PKCS#12 CA to inspect HTTP/1.1 and HTTP/2 traffic. TLS is pure Rust (`rustls` + `ring`), with no OpenSSL.
+- **Survives long silent connections:** No idle timeout on established connections, plus TCP keepalive on forward and reverse sockets (default `60s` idle, then `10s` × `5` probes), so NAT, firewalls, and VPNs don't drop agents waiting on slow responses.
 - **Built for operators:** `CLI > env > TOML` configuration, six log levels, `text` (logfmt) or `json` (NDJSON) access logs, graceful shutdown, and connection and certificate-cache caps.
 
 ---
