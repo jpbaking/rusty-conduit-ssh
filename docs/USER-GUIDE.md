@@ -345,7 +345,17 @@ curl --socks5-hostname 127.0.0.1:8888 https://example.com/
 The reverse proxy has **no authentication**, and it connects from your machine. Anyone who can reach its remote port can reach what your machine can reach, including `127.0.0.1` services and your LAN.
 
 - Keep `--reverse-bind` on loopback, and use the reverse proxy only on SSH targets whose local users you trust.
-- A non-loopback `--reverse-bind` logs a security notice. It also requires `GatewayPorts clientspecified` or `yes` in the server's `sshd_config`. Without that, sshd may bind loopback instead.
+- **The SSH server decides the final bind address, not `--reverse-bind`.** Check `GatewayPorts` in the target's `sshd_config`. It may be set inside a `Match` block, so run `sudo sshd -T -C user=<you>,host=<client-host>,addr=<client-ip> | grep -i gatewayports` to see the value that applies to you:
+
+  | `GatewayPorts` | `--reverse-bind 127.0.0.1` | Non-loopback `--reverse-bind` |
+  | :--- | :--- | :--- |
+  | `no` (default) | Loopback | Loopback. The requested address is ignored without an error |
+  | `clientspecified` (**recommended**) | Loopback | The requested address |
+  | `yes` | **All interfaces** | All interfaces |
+
+  With `yes`, sshd binds every remote forward to the wildcard address **even when you request `127.0.0.1`**, so the unauthenticated reverse proxy is open to the network. The client cannot detect this: the SSH reply carries only the port. Use `GatewayPorts clientspecified` on targets where you run the reverse proxy. It honours the address you request, keeps `127.0.0.1` private, and still allows a deliberate non-loopback bind. Confirm with `ss -tlnp` on the target.
+- A non-loopback `--reverse-bind` logs a security notice.
+- Add a `--reverse-block` blocklist such as `127.0.0.0/8,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16` as a second line of defence, so an exposed port still cannot reach your loopback services or LAN.
 
 ---
 
@@ -353,6 +363,7 @@ The reverse proxy has **no authentication**, and it connects from your machine. 
 
 - Keep `--bind` on loopback unless a firewall restricts access. v1 has **no proxy authentication**, and a non-loopback bind logs a security notice at startup.
 - Keep `--reverse-bind` on loopback. The reverse proxy gives its clients access to whatever your machine can reach, including its loopback services.
+- On SSH targets where you run the reverse proxy, set `GatewayPorts clientspecified` in `sshd_config`. With `GatewayPorts yes`, sshd binds remote forwards to all interfaces even when you request `127.0.0.1`.
 - Keep `--ssh-socks-bind` on loopback. The `ssh -D` listener is also unauthenticated and reaches everything the SSH target can reach.
 - Prefer `RUSTY_CONDUIT_SSH_MITM_CA_PASSPHRASE` or `--mitm-ca-passphrase-file` over `--mitm-ca-passphrase`, which is visible in process listings and shell history.
 - Keep `--max-connections` and `--reverse-max-connections` bounded on shared hosts.

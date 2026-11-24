@@ -115,7 +115,7 @@ curl --socks5-hostname 127.0.0.1:8888 https://example.com/
 ## Security notes
 
 - v1 has **no proxy authentication**. Keep the default loopback bind, or restrict access with a firewall if you use `--bind` with another address.
-- The **reverse proxy** lets anyone who can reach its remote port connect to whatever your machine can reach, **including services on your loopback interface and LAN**. Keep the default `--reverse-bind 127.0.0.1`, and enable it only on SSH targets whose local users you trust.
+- The **reverse proxy** lets anyone who can reach its remote port connect to whatever your machine can reach, **including services on your loopback interface and LAN**. Keep the default `--reverse-bind 127.0.0.1`, and enable it only on SSH targets whose local users you trust. The SSH server has the final say on the bind address: with `GatewayPorts yes` in its `sshd_config`, it listens on **all interfaces even when you request `127.0.0.1`**. Use `GatewayPorts clientspecified` on those targets. See the [User Guide](docs/USER-GUIDE.md#security) for details.
 - Your machine still resolves the **SSH target's own hostname**, because `ssh` must reach it before the tunnel exists.
 - MITM decrypts traffic. Only use it on systems and traffic you are authorized to inspect, and protect the CA private key.
 
