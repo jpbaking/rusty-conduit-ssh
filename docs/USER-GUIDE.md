@@ -32,7 +32,7 @@ Environment variable names below omit the `RUSTY_CONDUIT_SSH_` prefix. For examp
 | `--bind <IP>` | `BIND` | `bind` | `127.0.0.1` | IPv4 or IPv6 listener address |
 | `--http-port <PORT>` | `HTTP_PORT` | `http_port` | `3128` | HTTP/HTTPS port, `0` disables |
 | `--socks-port <PORT>` | `SOCKS_PORT` | `socks_port` | `1080` | SOCKS4/5 port, `0` disables |
-| `--max-connections <N>` | `MAX_CONNECTIONS` | `max_connections` | `4096` | Concurrent client cap, `0` = unlimited. Excess connections are closed immediately |
+| `--max-connections <N>` | `MAX_CONNECTIONS` | `max_connections` | `4096` | Concurrent forward proxy clients, HTTP and SOCKS combined, `0` = unlimited. Excess connections are closed immediately. Also the reverse cap unless `--reverse-max-connections` is set |
 
 At least one forward or reverse listener must be enabled. Setting both ports to the same non-zero value serves all protocols on that port.
 
@@ -43,6 +43,7 @@ At least one forward or reverse listener must be enabled. Setting both ports to 
 | `--reverse-bind <IP>` | `REVERSE_BIND` | `reverse.bind` | `127.0.0.1` | Bind address on the SSH target for `ssh -R` |
 | `--reverse-http-port <PORT>` | `REVERSE_HTTP_PORT` | `reverse.http_port` | `0` | HTTP/HTTPS port on the SSH target, `0` disables |
 | `--reverse-socks-port <PORT>` | `REVERSE_SOCKS_PORT` | `reverse.socks_port` | `0` | SOCKS4/4a/5 port on the SSH target, `0` disables |
+| `--reverse-max-connections <N>` | `REVERSE_MAX_CONNECTIONS` | `reverse.max_connections` | same as `--max-connections` | Concurrent reverse proxy clients, HTTP and SOCKS combined, `0` = unlimited. Excess connections are closed immediately |
 | `--reverse-allow <RULE>` | `REVERSE_ALLOW` | `reverse.allow` | none | Reverse allowlist (IP, CIDR, FQDN, or `*.domain`); mutually exclusive with `--reverse-block` |
 | `--reverse-block <RULE>` | `REVERSE_BLOCK` | `reverse.block` | none | Reverse blocklist (IP, CIDR, FQDN, or `*.domain`); mutually exclusive with `--reverse-allow` |
 
@@ -136,6 +137,8 @@ startup_timeout = "30s"
 bind = "127.0.0.1"
 http_port = 0
 socks_port = 0
+# Unset: the top-level max_connections applies here too.
+# max_connections = 64
 
 [mitm]
 # Use either ca_cert + ca_key, or ca_p12.
@@ -333,7 +336,7 @@ curl --socks5-hostname 127.0.0.1:8888 https://example.com/
 - **Egress and DNS are local.** Reverse connections dial directly from your machine and use its resolver, so hostnames are resolved there rather than on the SSH target.
 - **Local ports stay stable.** The ephemeral loopback listeners are bound once at startup and reused by every reconnect.
 - **Remote bind failures are retried.** With `ExitOnForwardFailure=yes`, `ssh` exits if the remote port is taken, and the supervisor retries with backoff. After an abrupt disconnect, sshd may hold the old port until it notices the dead session, so setting `ClientAliveInterval` on the server shortens that window.
-- **`--max-connections` applies separately** to the forward and reverse proxies, so one side cannot exhaust the other.
+- **Each direction has its own connection cap**, so one side cannot exhaust the other. The forward proxy uses `--max-connections` and the reverse proxy uses `--reverse-max-connections`, which defaults to the same value. Within one direction, HTTP and SOCKS share the cap. Set a lower reverse cap to limit how much remote clients can open through your machine.
 - **MITM applies to both directions** when a CA is configured. The reverse proxy has its own certificate cache and dials directly.
 - **Logs are shared.** Reverse connections go to the same access and SOCKS logs as forward connections.
 
@@ -352,4 +355,4 @@ The reverse proxy has **no authentication**, and it connects from your machine. 
 - Keep `--reverse-bind` on loopback. The reverse proxy gives its clients access to whatever your machine can reach, including its loopback services.
 - Keep `--ssh-socks-bind` on loopback. The `ssh -D` listener is also unauthenticated and reaches everything the SSH target can reach.
 - Prefer `RUSTY_CONDUIT_SSH_MITM_CA_PASSPHRASE` or `--mitm-ca-passphrase-file` over `--mitm-ca-passphrase`, which is visible in process listings and shell history.
-- Keep `--max-connections` bounded on shared hosts.
+- Keep `--max-connections` and `--reverse-max-connections` bounded on shared hosts.

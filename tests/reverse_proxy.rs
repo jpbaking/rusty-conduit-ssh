@@ -468,3 +468,35 @@ async fn access_logs_tag_forward_and_reverse_direction() {
         "missing reverse SOCKS log:\n{socks_lines}"
     );
 }
+
+#[tokio::test]
+async fn reverse_connection_cap_is_its_own() {
+    let echo = spawn_echo().await;
+    let app = App::start(MockSsh::new(), true, |cfg| {
+        cfg.max_connections = 0;
+        cfg.reverse_max_connections = 1;
+        cfg.reverse_socks_port = 1081;
+    })
+    .await;
+    let proxy = listener_for(&app.specs(), 1081);
+
+    // One relayed connection holds the only reverse permit, although the forward cap is unlimited.
+    let (mut held, rep) = socks5(proxy, CONNECT, Socks5Addr::V4(LOOPBACK), echo.addr.port()).await;
+    assert_eq!(rep, 0);
+    assert_eq!(roundtrip(&mut held, b"held").await, b"held");
+
+    // The next one is closed without a reply. Served, it would answer the greeting with [5, 0].
+    let mut extra = TcpStream::connect(proxy).await.unwrap();
+    let _ = tokio::io::AsyncWriteExt::write_all(&mut extra, &[5, 1, 0]).await;
+    let mut buf = [0u8; 2];
+    let read = tokio::time::timeout(WAIT, tokio::io::AsyncReadExt::read(&mut extra, &mut buf))
+        .await
+        .expect("over-cap connection was left open");
+    assert!(
+        matches!(read, Ok(0) | Err(_)),
+        "over-cap connection was served: {read:?} {buf:?}"
+    );
+
+    drop(held);
+    app.stop().await;
+}

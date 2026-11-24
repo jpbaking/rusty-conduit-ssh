@@ -256,6 +256,14 @@ pub struct CliArgs {
     )]
     pub reverse_socks_port: Option<u16>,
 
+    /// Maximum concurrent reverse proxy client connections, 0 = unlimited [default: same as --max-connections]
+    #[arg(
+        long,
+        value_name = "N",
+        env = "RUSTY_CONDUIT_SSH_REVERSE_MAX_CONNECTIONS"
+    )]
+    pub reverse_max_connections: Option<usize>,
+
     /// Allowlist of destinations for the reverse proxy (IP, CIDR, FQDN, or *.domain); repeatable or comma-separated
     #[arg(
         long,
@@ -540,6 +548,8 @@ pub struct FileReverseConfig {
     pub bind: Option<IpAddr>,
     pub http_port: Option<u16>,
     pub socks_port: Option<u16>,
+    /// Unset means the forward `max_connections` applies.
+    pub max_connections: Option<usize>,
     pub allow: Option<Vec<String>>,
     pub block: Option<Vec<String>>,
 }
@@ -669,6 +679,9 @@ pub struct Config {
     pub reverse_http_port: u16,
     /// Remote SOCKS4/4a/5 reverse proxy port (`0` = disabled).
     pub reverse_socks_port: u16,
+    /// Maximum concurrent reverse proxy client connections (`0` = unlimited). When no layer
+    /// sets it, it takes the resolved `max_connections`.
+    pub reverse_max_connections: usize,
     /// Reverse proxy destination allowlist (mutually exclusive with `reverse_block`).
     pub reverse_allow: Vec<FilterRule>,
     /// Reverse proxy destination blocklist (mutually exclusive with `reverse_allow`).
@@ -720,6 +733,7 @@ impl fmt::Debug for Config {
             .field("reverse_bind", &self.reverse_bind)
             .field("reverse_http_port", &self.reverse_http_port)
             .field("reverse_socks_port", &self.reverse_socks_port)
+            .field("reverse_max_connections", &self.reverse_max_connections)
             .field("mitm_ca_cert", &self.mitm_ca_cert)
             .field("mitm_ca_key", &self.mitm_ca_key)
             .field("mitm_ca_p12", &self.mitm_ca_p12)
@@ -778,6 +792,7 @@ impl Default for Config {
             reverse_bind: DEFAULT_REVERSE_BIND,
             reverse_http_port: 0,
             reverse_socks_port: 0,
+            reverse_max_connections: DEFAULT_MAX_CONNECTIONS,
             reverse_allow: Vec::new(),
             reverse_block: Vec::new(),
             mitm_ca_cert: None,
@@ -924,15 +939,16 @@ impl Config {
             a.ssh_args
         };
 
+        let max_connections = a
+            .max_connections
+            .or(file.max_connections)
+            .unwrap_or(d.max_connections);
         Ok(Config {
             config_path: a.config,
             bind: a.bind.or(file.bind).unwrap_or(d.bind),
             http_port: a.http_port.or(file.http_port).unwrap_or(d.http_port),
             socks_port: a.socks_port.or(file.socks_port).unwrap_or(d.socks_port),
-            max_connections: a
-                .max_connections
-                .or(file.max_connections)
-                .unwrap_or(d.max_connections),
+            max_connections,
             allow,
             block,
             reverse_bind: a
@@ -947,6 +963,11 @@ impl Config {
                 .reverse_socks_port
                 .or(file.reverse.socks_port)
                 .unwrap_or(d.reverse_socks_port),
+            // Each layer's own reverse value wins; otherwise follow the forward cap.
+            reverse_max_connections: a
+                .reverse_max_connections
+                .or(file.reverse.max_connections)
+                .unwrap_or(max_connections),
             reverse_allow,
             reverse_block,
             mitm_ca_cert: a.mitm_ca_cert.or(file.mitm.ca_cert),
@@ -1211,11 +1232,13 @@ impl Config {
                 .map(|f| format!(" reverse_filter={}({})", f.mode_str(), f.len()))
                 .unwrap_or_default();
             format!(
-                " reverse_bind={} reverse_http_port={} reverse_socks_port={} reverse_multiplexed={}{reverse_filter}",
+                " reverse_bind={} reverse_http_port={} reverse_socks_port={} reverse_multiplexed={} \
+                 reverse_max_connections={}{reverse_filter}",
                 self.reverse_bind,
                 port(self.reverse_http_port),
                 port(self.reverse_socks_port),
                 self.is_reverse_multiplexed(),
+                cap(self.reverse_max_connections),
             )
         } else {
             String::new()
@@ -1281,6 +1304,7 @@ mod tests {
         "RUSTY_CONDUIT_SSH_REVERSE_BIND",
         "RUSTY_CONDUIT_SSH_REVERSE_HTTP_PORT",
         "RUSTY_CONDUIT_SSH_REVERSE_SOCKS_PORT",
+        "RUSTY_CONDUIT_SSH_REVERSE_MAX_CONNECTIONS",
         "RUSTY_CONDUIT_SSH_REVERSE_ALLOW",
         "RUSTY_CONDUIT_SSH_REVERSE_BLOCK",
         "RUSTY_CONDUIT_SSH_MITM_CERT_CACHE_MAX_ENTRIES",
@@ -1831,6 +1855,61 @@ socks_log = "/file/socks.log"
     }
 
     #[test]
+    fn reverse_cap_follows_forward_cap_when_unset() {
+        let _env = EnvGuard::new(&[]);
+        assert_eq!(load(&[]).unwrap().reverse_max_connections, 4096);
+
+        let path = temp_file(CAPS_TOML);
+        let cfg = load(&["--config", path.to_str().unwrap()]).unwrap();
+        assert_eq!(cfg.reverse_max_connections, 11);
+        let cfg = load(&[
+            "--config",
+            path.to_str().unwrap(),
+            "--max-connections",
+            "55",
+        ])
+        .unwrap();
+        assert_eq!(
+            cfg.reverse_max_connections, 55,
+            "follows the winning forward layer"
+        );
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn reverse_cap_layers_override_forward_cap() {
+        let path = temp_file("max_connections = 11\n[reverse]\nmax_connections = 22\n");
+        let env = EnvGuard::new(&[]);
+        let cfg = load(&["--config", path.to_str().unwrap()]).unwrap();
+        assert_eq!((cfg.max_connections, cfg.reverse_max_connections), (11, 22));
+        drop(env);
+
+        let _env = EnvGuard::new(&[("RUSTY_CONDUIT_SSH_REVERSE_MAX_CONNECTIONS", "33")]);
+        let cfg = load(&[
+            "--config",
+            path.to_str().unwrap(),
+            "--max-connections",
+            "55",
+        ])
+        .unwrap();
+        assert_eq!((cfg.max_connections, cfg.reverse_max_connections), (55, 33));
+
+        let cfg = load(&[
+            "--config",
+            path.to_str().unwrap(),
+            "--reverse-max-connections",
+            "0",
+        ])
+        .unwrap();
+        assert_eq!(
+            (cfg.max_connections, cfg.reverse_max_connections),
+            (11, 0),
+            "CLI beats env"
+        );
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
     fn caps_zero_means_unlimited_at_every_layer() {
         let path = temp_file("max_connections = 0\n[mitm]\ncert_cache_max_entries = 0\n");
         let _env = EnvGuard::new(&[]);
@@ -2314,6 +2393,7 @@ extra_args = ["-o", "Compression=yes"]
         let s = cfg.summary();
         assert!(s.contains("reverse_bind=127.0.0.1"), "{s}");
         assert!(s.contains("reverse_http_port=8888"), "{s}");
+        assert!(s.contains("reverse_max_connections=4096"), "{s}");
         assert!(s.contains("reverse_socks_port=8888"), "{s}");
         assert!(s.contains("reverse_multiplexed=true"), "{s}");
 

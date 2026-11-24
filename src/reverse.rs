@@ -63,7 +63,7 @@ impl ReverseProxy {
         )
         .await
         .map_err(|e| format!("reverse proxy: {e}"))?
-        .with_max_connections(cfg.max_connections);
+        .with_max_connections(cfg.reverse_max_connections);
 
         let mut forwards = Vec::new();
         for (role, local) in server.listeners() {
