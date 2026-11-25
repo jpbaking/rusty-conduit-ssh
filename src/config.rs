@@ -24,7 +24,9 @@ use serde::Deserialize;
 
 use crate::filter::{FilterRule, HostFilter};
 use crate::logging::{LogFormat, LogLevel};
+use crate::mitm::MitmOptions;
 use crate::net::KeepaliveSettings;
+use crate::server::ServerOptions;
 
 /// Default bind address.
 pub const DEFAULT_BIND: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -692,11 +694,7 @@ impl FileConfig {
 }
 
 /// Where the MITM CA comes from (only present when MITM mode is ON).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CaSource {
-    Pem { cert: PathBuf, key: PathBuf },
-    Pkcs12 { path: PathBuf },
-}
+pub use crate::mitm::CaSource;
 
 /// Fully merged configuration.
 #[derive(Clone, PartialEq, Eq)]
@@ -1286,6 +1284,28 @@ impl Config {
             );
         }
         out
+    }
+
+    /// Forward (`ssh -D`) listener settings for the engine [`Server`](crate::server::Server).
+    pub fn server_options(&self) -> ServerOptions {
+        ServerOptions {
+            bind: self.bind,
+            http_port: self.http_port,
+            socks_port: self.socks_port,
+            max_connections: self.max_connections,
+            keepalive: self.tcp_keepalive_settings(),
+        }
+    }
+
+    /// MITM settings for the engine ([`MitmState`](crate::mitm::MitmState)).
+    pub fn mitm_options(&self) -> MitmOptions {
+        MitmOptions {
+            ca: self.ca_source(),
+            passphrase: self.mitm_ca_passphrase.clone(),
+            passphrase_file: self.mitm_ca_passphrase_file.clone(),
+            cert_ttl: self.mitm_cert_ttl,
+            cert_cache_max: self.mitm_cert_cache_max_entries,
+        }
     }
 
     /// The configured TCP keepalive parameters, or `None` when keepalive is disabled.

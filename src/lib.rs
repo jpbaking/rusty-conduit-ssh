@@ -1,17 +1,25 @@
 //! rusty-conduit-ssh: HTTP/HTTPS and SOCKS4/4a/5 proxy server routed through an SSH tunnel.
+//!
+//! The protocol front end (listeners, mux, HTTP/HTTPS, SOCKS4/4a/5, MITM, filter, logging)
+//! is `rusty-conduit-engine`, re-exported here under the historical module paths. This
+//! crate keeps the CLI/TOML layer ([`config`]), the `ssh` supervisor ([`ssh`]), the tunnel
+//! dialer ([`net::Socks5UpstreamDialer`], registered as the API-only `external` engine
+//! profile [`TUNNEL_PROFILE`] that every forward connection routes to), and the reverse
+//! proxy ([`reverse`]: a second engine server with direct egress, exposed via `ssh -R`).
 
 pub mod config;
-pub mod filter;
-pub mod http;
-pub mod logging;
-pub mod mitm;
-pub mod mux;
 pub mod net;
 pub mod reverse;
-pub mod server;
-pub mod socks;
 pub mod ssh;
+#[cfg(test)]
+mod test_support;
 
+pub use rusty_conduit_engine::{
+    filter, http, logging, mitm, mux, router, routing, server, socks, upstream,
+};
+pub use server::EngineHandlers;
+
+use std::collections::BTreeMap;
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -19,46 +27,66 @@ use tokio_util::sync::CancellationToken;
 
 use config::{CliInput, Config};
 use http::HttpProxy;
-use logging::{AccessLogConfig, AccessLogger, LogLevel, Logger};
+use logging::{AccessLogConfig, AccessLogger, LogLevel, Logger, ProxyDirection};
 use mitm::MitmState;
-use net::{FilteredDialer, Socks5UpstreamDialer, UpstreamDialer};
+use net::{Socks5UpstreamDialer, UpstreamDialer, DEFAULT_CONNECT_TIMEOUT};
 use reverse::ReverseProxy;
-use server::{Connection, HandlerFuture, ProtocolHandlers, Server};
+use routing::{
+    OneOrMany, ProfileConfig, ProfileType, RoutingConfig, RoutingInput, RoutingSetupError,
+    RoutingState, SharedRouting,
+};
+use server::{ProtocolHandlers, Server};
 use socks::SocksProxy;
 use ssh::{SshHandle, SshSupervisor, SshTunnelConfig};
+use upstream::DialerOptions;
 
 /// Exit code used for `FATAL` startup errors.
 pub const EXIT_FATAL: u8 = 1;
 
-/// Protocol engines wired into the [`Server`]: the HTTP/HTTPS proxy for HTTP connections
-/// and the SOCKS4/4a/5 engine for SOCKS connections (dedicated and multiplexed listeners).
-#[derive(Debug, Clone)]
-pub struct EngineHandlers {
-    http: HttpProxy,
-    socks: SocksProxy,
+/// Name of the API-only `external` engine profile that carries all forward traffic through
+/// the `ssh -D` tunnel. Never shown in logs (routing fields are disabled).
+pub const TUNNEL_PROFILE: &str = "ssh-tunnel";
+
+/// Access-log settings: the rusty-conduit-ssh schema has no `rule` / `profile` / `upstream`
+/// fields (there is no user-visible routing), and tags each record with `direction`.
+pub fn access_log_config(cfg: &Config) -> AccessLogConfig {
+    AccessLogConfig::new(
+        cfg.log_level,
+        cfg.log_format,
+        cfg.http_access_log.clone(),
+        cfg.socks_log.clone(),
+    )
+    .with_routing_fields(false)
 }
 
-impl EngineHandlers {
-    pub fn new(http: HttpProxy, socks: SocksProxy) -> Self {
-        Self { http, socks }
-    }
+/// Forward routing: every request goes to [`TUNNEL_PROFILE`] (served by `dialer`), with the
+/// forward allow/block filter checked on the requested name or IP literal by the router (no
+/// local DNS), the configured keepalive, and the default connect timeout.
+pub fn forward_routing(
+    cfg: &Config,
+    dialer: Arc<dyn UpstreamDialer>,
+) -> Result<RoutingState, RoutingSetupError> {
+    let profiles = BTreeMap::from([(
+        TUNNEL_PROFILE.to_string(),
+        ProfileConfig::of_kind(ProfileType::External),
+    )]);
+    let input = RoutingInput {
+        profiles,
+        routing: RoutingConfig {
+            default: OneOrMany::One(TUNNEL_PROFILE.to_string()),
+            ..RoutingConfig::default()
+        },
+        filter: cfg.forward_filter(),
+        mitm_enabled: cfg.mitm_enabled(),
+        listeners: Vec::new(),
+        keepalive: cfg.tcp_keepalive_settings(),
+        connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+    };
+    RoutingState::from_input(
+        &input,
+        DialerOptions::default().with_external(TUNNEL_PROFILE, dialer),
+    )
 }
-
-impl ProtocolHandlers for EngineHandlers {
-    fn http(&self, conn: Connection) -> HandlerFuture {
-        let proxy = self.http.clone();
-        Box::pin(async move { proxy.serve(conn).await })
-    }
-    fn socks4(&self, conn: Connection) -> HandlerFuture {
-        let proxy = self.socks.clone();
-        Box::pin(async move { proxy.serve_v4(conn).await })
-    }
-    fn socks5(&self, conn: Connection) -> HandlerFuture {
-        let proxy = self.socks.clone();
-        Box::pin(async move { proxy.serve_v5(conn).await })
-    }
-}
-
 /// Merge and validate configuration from parsed CLI/env input.
 ///
 /// On failure returns the error together with the best-known log level (the merged level if
@@ -114,17 +142,7 @@ pub async fn run_until(cfg: Config, logger: Logger, interrupted: CancellationTok
             return ExitCode::from(EXIT_FATAL);
         }
     };
-    let access = match AccessLogger::start(
-        AccessLogConfig::new(
-            cfg.log_level,
-            cfg.log_format,
-            cfg.http_access_log.clone(),
-            cfg.socks_log.clone(),
-        ),
-        logger.clone(),
-    )
-    .await
-    {
+    let access = match AccessLogger::start(access_log_config(&cfg), logger.clone()).await {
         Ok(a) => a,
         Err(e) => {
             logger.fatal(format!("failed to open access log: {e}"));
@@ -153,10 +171,7 @@ pub async fn run_until(cfg: Config, logger: Logger, interrupted: CancellationTok
     // so only the supervisor cancels `tunnel_lost`, and only signals cancel `interrupted`.
     let tunnel_lost = CancellationToken::new();
     let (ssh, tunnel_state) = SshSupervisor::spawn(tunnel_cfg, logger.clone(), tunnel_lost.clone());
-    let mut dialer: Arc<dyn UpstreamDialer> = Arc::new(Socks5UpstreamDialer::new(tunnel_state));
-    if let Some(filter) = cfg.forward_filter() {
-        dialer = Arc::new(FilteredDialer::new(dialer, Arc::new(filter)));
-    }
+    let dialer: Arc<dyn UpstreamDialer> = Arc::new(Socks5UpstreamDialer::new(tunnel_state));
 
     let outcome = serve(
         &cfg,
@@ -202,7 +217,7 @@ async fn serve(
 ) -> Result<(), String> {
     // Built before waiting so a bad CA fails without sitting through SSH authentication.
     let mitm = if cfg.forward_enabled() {
-        MitmState::from_config(cfg, Arc::clone(&dialer))
+        MitmState::from_options(&cfg.mitm_options())
             .map_err(|e| format!("MITM setup failed: {e}"))?
     } else {
         None
@@ -228,9 +243,13 @@ async fn serve(
         return Ok(());
     }
 
-    let (http, socks) = build_engines(cfg, mitm.as_ref(), access, logger, dialer);
+    let routing = forward_routing(cfg, dialer)
+        .map_err(|e| format!("forward routing setup failed: {e}"))?
+        .shared();
+    let access = access.clone().with_direction(ProxyDirection::Forward);
+    let (http, socks) = build_engines_with(cfg, mitm.as_ref(), &access, logger, routing);
     let handlers: Arc<dyn ProtocolHandlers> = Arc::new(EngineHandlers::new(http, socks));
-    let server = Server::from_config(cfg, handlers, logger.clone())
+    let server = Server::from_options(&cfg.server_options(), handlers, logger.clone())
         .await
         .map_err(|e| e.to_string())?;
     // The leaf-certificate reaper runs only when MITM is enabled and stops on shutdown.
@@ -261,7 +280,8 @@ async fn serve(
     Ok(())
 }
 
-/// Build the HTTP and SOCKS engines, all dialing through `dialer`, enabling HTTPS interception
+/// Build the forward HTTP and SOCKS engines, all dialing through `dialer` (see
+/// [`forward_routing`]) and logging with `direction=forward`, enabling HTTPS interception
 /// when `mitm` is present and the SOCKS web guard when additionally
 /// `--socks-block-web-in-mitm` is set.
 pub fn build_engines(
@@ -271,8 +291,26 @@ pub fn build_engines(
     logger: &Logger,
     dialer: Arc<dyn UpstreamDialer>,
 ) -> (HttpProxy, SocksProxy) {
-    let mut http = HttpProxy::new(access.clone(), logger.clone(), Arc::clone(&dialer));
-    let mut socks = SocksProxy::new(access.clone(), logger.clone(), dialer);
+    let routing = forward_routing(cfg, dialer)
+        .expect("the fixed single-profile forward routing always compiles")
+        .shared();
+    let access = access.clone().with_direction(ProxyDirection::Forward);
+    build_engines_with(cfg, mitm, &access, logger, routing)
+}
+
+/// Build the HTTP and SOCKS engines over `routing`, logging through `access` (already tagged
+/// with its direction) in the rusty-conduit-ssh schema (no routing fields), with MITM and the
+/// SOCKS web guard as for [`build_engines`].
+pub(crate) fn build_engines_with(
+    cfg: &Config,
+    mitm: Option<&MitmState>,
+    access: &AccessLogger,
+    logger: &Logger,
+    routing: SharedRouting,
+) -> (HttpProxy, SocksProxy) {
+    let access = &access.clone().with_routing_fields(false);
+    let mut http = HttpProxy::new(Arc::clone(&routing), access.clone(), logger.clone());
+    let mut socks = SocksProxy::new(routing, access.clone(), logger.clone());
     if let Some(m) = mitm {
         logger.info(format!(
             "MITM enabled: CA \"{}\" valid until {}; leaf certificate TTL {}",
@@ -356,9 +394,10 @@ pub fn main_entry() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::http::test_support::{capture_access, direct_dialer, quiet_logger, Buf};
     use crate::server::ListenPlan;
-    use crate::socks::test_support::{echo_roundtrip, spawn_echo};
+    use crate::test_support::{
+        capture_access, direct_dialer, echo_roundtrip, quiet_logger, spawn_echo, Buf,
+    };
 
     use std::net::SocketAddr;
 
@@ -430,10 +469,14 @@ mod tests {
 
     async fn engine_server(plan: ListenPlan) -> (Server, Buf) {
         let (access, log) = capture_access().await;
-        let handlers: Arc<dyn ProtocolHandlers> = Arc::new(EngineHandlers::new(
-            HttpProxy::new(access.clone(), quiet_logger(), direct_dialer()),
-            SocksProxy::new(access, quiet_logger(), direct_dialer()),
-        ));
+        let (http, socks) = build_engines(
+            &Config::default(),
+            None,
+            &access,
+            &quiet_logger(),
+            direct_dialer(),
+        );
+        let handlers: Arc<dyn ProtocolHandlers> = Arc::new(EngineHandlers::new(http, socks));
         let server = Server::bind(plan, handlers, quiet_logger()).await.unwrap();
         (server, log)
     }
@@ -514,8 +557,8 @@ mod tests {
     /// MITM wiring through `build_engines` + the real server on a multiplexed port.
     #[tokio::test]
     async fn mitm_active_through_server_wiring() {
-        use crate::http::mitm_tunnel::{client_config_with_roots, test_support as mt};
-        use crate::mitm::ca::test_support::test_ca;
+        use crate::http::mitm_tunnel::client_config_with_roots;
+        use crate::test_support::{self as mt, test_ca};
         use http_body_util::BodyExt;
 
         let origin = mt::spawn_origin().await;
@@ -535,11 +578,10 @@ mod tests {
         let provider = crate::mitm::crypto_provider();
         let upstream = client_config_with_roots(provider.clone(), roots).unwrap();
         let state = MitmState::build(
-            &cfg,
+            &cfg.mitm_options(),
             &cfg.ca_source().unwrap(),
             provider,
             upstream,
-            direct_dialer(),
         )
         .unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
@@ -601,7 +643,7 @@ mod tests {
     #[tokio::test]
     async fn socks_web_guard_installed_only_with_mitm_and_flag() {
         use crate::http::mitm_tunnel::client_config_with_roots;
-        use crate::mitm::ca::test_support::test_ca;
+        use crate::test_support::test_ca;
 
         let dir = std::env::temp_dir().join(format!("rc-lib-guard-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -619,11 +661,10 @@ mod tests {
         let upstream =
             client_config_with_roots(provider.clone(), rustls::RootCertStore::empty()).unwrap();
         let state = MitmState::build(
-            &cfg,
+            &cfg.mitm_options(),
             &cfg.ca_source().unwrap(),
             provider,
             upstream,
-            direct_dialer(),
         )
         .unwrap();
         std::fs::remove_dir_all(&dir).unwrap();

@@ -1,27 +1,26 @@
-//! Shared upstream dial and relay utilities.
+//! Upstream dial utilities for the SSH tunnel.
 //!
-//! Every upstream TCP connection goes through an [`UpstreamDialer`]. In production that is
-//! [`Socks5UpstreamDialer`], which speaks RFC 1928 to the local `ssh -D` listener and sends
-//! hostnames as `ATYP=0x03`, so DNS is resolved on the SSH target and never locally.
-//! [`DirectDialer`] connects from this machine using its resolver. It backs the reverse proxy
-//! (`ssh -R`), whose clients egress locally, and isolated tests.
+//! The socket helpers ([`KeepaliveSettings`], [`PrefixedStream`], [`relay_bidirectional`],
+//! ...) and the [`UpstreamDialer`] contract come from `rusty-conduit-engine` and are
+//! re-exported here. This module adds what is specific to rusty-conduit-ssh: the live
+//! [`TunnelState`] published by the SSH supervisor and [`Socks5UpstreamDialer`], which speaks
+//! RFC 1928 to the local `ssh -D` listener and sends hostnames as `ATYP=0x03`, so DNS is
+//! resolved on the SSH target and never locally. The forward proxy registers it as an
+//! API-only `external` engine profile; the reverse proxy (`ssh -R`) egresses through the
+//! engine's [`DirectDialer`].
 
-use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
-use std::pin::Pin;
-use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{lookup_host, TcpStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::sync::watch;
-use tokio::time::Instant;
 
-use crate::filter::{access_denied_error, normalize_domain, AccessDenied, HostFilter};
-
-/// Default timeout for establishing an upstream TCP connection.
-pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub use rusty_conduit_engine::net::*;
+pub use rusty_conduit_engine::upstream::{
+    DialError, DialFuture, DirectDialer, UpstreamDialer, UpstreamStream,
+};
 
 const SOCKS_VERSION: u8 = 0x05;
 const METHOD_NO_AUTH: u8 = 0x00;
@@ -29,85 +28,6 @@ const CMD_CONNECT: u8 = 0x01;
 const ATYP_IPV4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x03;
 const ATYP_IPV6: u8 = 0x04;
-
-/// TCP keepalive parameters applied to client sockets and direct upstream sockets.
-///
-/// Probes are sent by the OS kernel only while a connection is completely idle; they carry no
-/// payload and are invisible to HTTP, TLS, SOCKS, and any tunneled protocol. They keep NAT /
-/// firewall / VPN state alive during long silent periods and let dead peers be detected after
-/// roughly `idle + interval * retries`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct KeepaliveSettings {
-    /// Idle time before the first probe is sent.
-    pub idle: Duration,
-    /// Time between unanswered probes.
-    pub interval: Duration,
-    /// Unanswered probes before the OS closes the connection.
-    pub retries: u32,
-}
-
-impl KeepaliveSettings {
-    /// Default: first probe after 60s idle, then every 10s, give up after 5 misses.
-    pub const DEFAULT: Self = Self {
-        idle: Duration::from_secs(60),
-        interval: Duration::from_secs(10),
-        retries: 5,
-    };
-
-    /// Enable `SO_KEEPALIVE` on `stream` with these parameters. On platforms without
-    /// per-socket interval / retry control only the idle time is applied.
-    pub fn apply(&self, stream: &TcpStream) -> io::Result<()> {
-        let params = socket2::TcpKeepalive::new().with_time(self.idle);
-        #[cfg(any(
-            target_os = "android",
-            target_os = "dragonfly",
-            target_os = "freebsd",
-            target_os = "fuchsia",
-            target_os = "illumos",
-            target_os = "ios",
-            target_os = "linux",
-            target_os = "macos",
-            target_os = "netbsd",
-            target_os = "windows",
-        ))]
-        let params = params
-            .with_interval(self.interval)
-            .with_retries(self.retries);
-        socket2::SockRef::from(stream).set_tcp_keepalive(&params)
-    }
-}
-
-impl Default for KeepaliveSettings {
-    fn default() -> Self {
-        Self::DEFAULT
-    }
-}
-
-impl std::fmt::Display for KeepaliveSettings {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "idle={} interval={} retries={}",
-            humantime::format_duration(self.idle),
-            humantime::format_duration(self.interval),
-            self.retries
-        )
-    }
-}
-
-/// Configure a freshly dialed upstream socket: `TCP_NODELAY` plus optional keepalive.
-///
-/// A keepalive failure is not fatal: the connection still works, it just will not probe.
-fn prepare_upstream(
-    stream: TcpStream,
-    keepalive: Option<&KeepaliveSettings>,
-) -> io::Result<TcpStream> {
-    stream.set_nodelay(true)?;
-    if let Some(ka) = keepalive {
-        let _ = ka.apply(&stream);
-    }
-    Ok(stream)
-}
 
 /// Live state of the SSH dynamic tunnel.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,164 +38,6 @@ pub enum TunnelState {
     Ready(SocketAddr),
     /// The tunnel is down, for the given reason.
     Disconnected(String),
-}
-
-/// Boxed future returned by [`UpstreamDialer::connect`].
-pub type DialFuture<'a> = Pin<Box<dyn Future<Output = io::Result<TcpStream>> + Send + 'a>>;
-
-/// Opens upstream TCP connections.
-pub trait UpstreamDialer: Send + Sync {
-    /// Connect to `host:port`, bounding the whole operation by `timeout`.
-    ///
-    /// `host` may be a DNS name or an IP literal (IPv6 with or without brackets).
-    fn connect(&self, host: &str, port: u16, timeout: Duration) -> DialFuture<'_>;
-}
-
-/// Dials targets directly from this machine using the OS resolver.
-///
-/// Used for reverse proxy egress, where routing through [`Socks5UpstreamDialer`] would loop
-/// traffic back to the SSH target, and by isolated tests. When a [`HostFilter`] is attached,
-/// both domain names and resolved IP addresses are checked before connecting. TCP keepalive
-/// is off unless set with [`DirectDialer::with_tcp_keepalive`].
-#[derive(Debug, Clone, Default)]
-pub struct DirectDialer {
-    filter: Option<Arc<HostFilter>>,
-    keepalive: Option<KeepaliveSettings>,
-}
-
-impl DirectDialer {
-    /// Create a direct dialer that enforces `filter` on both domain names and resolved IPs.
-    pub fn with_filter(filter: Arc<HostFilter>) -> Self {
-        Self {
-            filter: Some(filter),
-            keepalive: None,
-        }
-    }
-
-    /// Set TCP keepalive for upstream sockets (`None` disables).
-    pub fn with_tcp_keepalive(mut self, keepalive: Option<KeepaliveSettings>) -> Self {
-        self.keepalive = keepalive;
-        self
-    }
-}
-
-impl UpstreamDialer for DirectDialer {
-    fn connect(&self, host: &str, port: u16, timeout: Duration) -> DialFuture<'_> {
-        let host = strip_brackets(host).to_owned();
-        let filter = self.filter.clone();
-        let keepalive = self.keepalive;
-        Box::pin(async move {
-            let keepalive = keepalive.as_ref();
-            let Some(filter) = filter else {
-                let stream =
-                    tokio::time::timeout(timeout, TcpStream::connect((host.as_str(), port)))
-                        .await
-                        .map_err(|_| timed_out(&host, port, timeout))??;
-                return prepare_upstream(stream, keepalive);
-            };
-
-            let deadline = Instant::now() + timeout;
-            if let Ok(ip) = host.parse::<IpAddr>() {
-                filter.check_ip(ip).map_err(access_denied_error)?;
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                let stream =
-                    tokio::time::timeout(remaining, TcpStream::connect(SocketAddr::new(ip, port)))
-                        .await
-                        .map_err(|_| timed_out(&host, port, timeout))??;
-                return prepare_upstream(stream, keepalive);
-            }
-
-            let domain = normalize_domain(&host);
-            let domain_matched = filter.matches_domain(&domain);
-            match filter.as_ref() {
-                HostFilter::Block(_) if domain_matched => {
-                    return Err(access_denied_error(AccessDenied(format!(
-                        "destination {host} is blocklisted"
-                    ))));
-                }
-                HostFilter::Allow(_) if !domain_matched && !filter.has_ip_rules() => {
-                    return Err(access_denied_error(AccessDenied(format!(
-                        "destination {host} is not in allowlist"
-                    ))));
-                }
-                _ => {}
-            }
-
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let resolved: Vec<SocketAddr> =
-                tokio::time::timeout(remaining, lookup_host((host.as_str(), port)))
-                    .await
-                    .map_err(|_| timed_out(&host, port, timeout))??
-                    .collect();
-            if resolved.is_empty() {
-                return Err(io::Error::new(
-                    io::ErrorKind::AddrNotAvailable,
-                    format!("DNS returned no addresses for {host}"),
-                ));
-            }
-
-            let candidates: Vec<SocketAddr> = match filter.as_ref() {
-                HostFilter::Block(_) => {
-                    if let Some(blocked) = resolved.iter().find(|a| filter.matches_ip(a.ip())) {
-                        return Err(access_denied_error(AccessDenied(format!(
-                            "destination {host} resolved to blocklisted IP {}",
-                            blocked.ip()
-                        ))));
-                    }
-                    resolved
-                }
-                HostFilter::Allow(_) if domain_matched => resolved,
-                HostFilter::Allow(_) => {
-                    let allowed: Vec<SocketAddr> = resolved
-                        .into_iter()
-                        .filter(|a| filter.matches_ip(a.ip()))
-                        .collect();
-                    if allowed.is_empty() {
-                        return Err(access_denied_error(AccessDenied(format!(
-                            "destination {host} is not in allowlist"
-                        ))));
-                    }
-                    allowed
-                }
-            };
-
-            let mut last_err = None;
-            for addr in candidates {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Err(timed_out(&host, port, timeout));
-                }
-                match tokio::time::timeout(remaining, TcpStream::connect(addr)).await {
-                    Ok(Ok(stream)) => return prepare_upstream(stream, keepalive),
-                    Ok(Err(e)) => last_err = Some(e),
-                    Err(_) => return Err(timed_out(&host, port, timeout)),
-                }
-            }
-            Err(last_err.unwrap_or_else(|| timed_out(&host, port, timeout)))
-        })
-    }
-}
-
-/// Wraps an [`UpstreamDialer`] and enforces a [`HostFilter`] on the requested host before
-/// dialing (without performing any local DNS lookups).
-pub struct FilteredDialer {
-    inner: Arc<dyn UpstreamDialer>,
-    filter: Arc<HostFilter>,
-}
-
-impl FilteredDialer {
-    pub fn new(inner: Arc<dyn UpstreamDialer>, filter: Arc<HostFilter>) -> Self {
-        Self { inner, filter }
-    }
-}
-
-impl UpstreamDialer for FilteredDialer {
-    fn connect(&self, host: &str, port: u16, timeout: Duration) -> DialFuture<'_> {
-        if let Err(denied) = self.filter.check_host(host) {
-            return Box::pin(async move { Err(access_denied_error(denied)) });
-        }
-        self.inner.connect(host, port, timeout)
-    }
 }
 
 /// Dials targets through the SOCKS5 listener published by the SSH supervisor.
@@ -299,36 +61,38 @@ impl UpstreamDialer for Socks5UpstreamDialer {
             let proxy = match current {
                 TunnelState::Ready(addr) => addr,
                 TunnelState::Connecting => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::NotConnected,
-                        "SSH tunnel is still connecting",
-                    ));
+                    return Err(not_connected("SSH tunnel is still connecting".into()));
                 }
                 TunnelState::Disconnected(reason) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::NotConnected,
-                        format!("SSH tunnel is disconnected: {reason}"),
-                    ));
+                    return Err(not_connected(format!(
+                        "SSH tunnel is disconnected: {reason}"
+                    )));
                 }
             };
             let request = encode_connect_request(&host, port)?;
-            tokio::time::timeout(timeout, socks5_connect(proxy, &request))
+            let stream = tokio::time::timeout(timeout, socks5_connect(proxy, &request))
                 .await
-                .map_err(|_| timed_out(&host, port, timeout))?
+                .map_err(|_| timed_out(&host, port, timeout))??;
+            Ok(UpstreamStream::Tcp(stream))
         })
+    }
+
+    fn redacted_upstream(&self) -> String {
+        match &*self.state.borrow() {
+            TunnelState::Ready(addr) => format!("socks5://{addr}"),
+            TunnelState::Connecting | TunnelState::Disconnected(_) => "ssh-tunnel".to_string(),
+        }
     }
 }
 
-/// Relay bytes in both directions until both sides reach EOF (or either side errors).
-///
-/// Returns `(bytes_in, bytes_out)`: bytes read from `client` and written to `upstream`, and
-/// bytes read from `upstream` and written to `client`. Data is never retained.
-pub async fn relay_bidirectional<C, U>(client: &mut C, upstream: &mut U) -> io::Result<(u64, u64)>
-where
-    C: AsyncRead + AsyncWrite + Unpin + ?Sized,
-    U: AsyncRead + AsyncWrite + Unpin + ?Sized,
-{
-    tokio::io::copy_bidirectional(client, upstream).await
+/// The tunnel is not usable: typed [`DialError::NotConnected`] carried with
+/// [`io::ErrorKind::NotConnected`] (HTTP `502`, SOCKS general failure).
+fn not_connected(message: String) -> io::Error {
+    DialError::NotConnected {
+        kind: io::ErrorKind::NotConnected,
+        message,
+    }
+    .into_io()
 }
 
 fn strip_brackets(host: &str) -> &str {
@@ -337,14 +101,15 @@ fn strip_brackets(host: &str) -> &str {
         .unwrap_or(host)
 }
 
+/// Typed [`DialError::Timeout`] (kind [`io::ErrorKind::TimedOut`], HTTP `504`).
 fn timed_out(host: &str, port: u16, timeout: Duration) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::TimedOut,
-        format!(
+    DialError::Timeout {
+        message: format!(
             "connect to {host}:{port} timed out after {}",
             humantime::format_duration(timeout)
         ),
-    )
+    }
+    .into_io()
 }
 
 /// Build the RFC 1928 `CONNECT` request. Non-literal hosts are always sent as `ATYP=0x03`.
@@ -463,7 +228,6 @@ fn invalid_data(message: String) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::filter::FilterRule;
     use tokio::net::TcpListener;
     use tokio::task::JoinHandle;
 
@@ -513,7 +277,10 @@ mod tests {
         vec![0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x1f, 0x90]
     }
 
-    async fn assert_payload(mut stream: TcpStream) {
+    async fn assert_payload(stream: UpstreamStream) {
+        let UpstreamStream::Tcp(mut stream) = stream else {
+            panic!("expected a TCP stream, got {stream:?}");
+        };
         assert!(stream.nodelay().unwrap());
         let mut payload = Vec::new();
         stream.read_to_end(&mut payload).await.unwrap();
@@ -640,98 +407,5 @@ mod tests {
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         }
         assert!(encode_connect_request(&"a".repeat(255), 80).is_ok());
-    }
-
-    #[tokio::test]
-    async fn direct_dialer_and_relay_count_bytes() {
-        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let upstream_addr = upstream.local_addr().unwrap();
-        let upstream_task = tokio::spawn(async move {
-            let (mut sock, _) = upstream.accept().await.unwrap();
-            let mut received = Vec::new();
-            sock.read_to_end(&mut received).await.unwrap();
-            sock.write_all(&[b'r'; 2500]).await.unwrap();
-            sock.shutdown().await.unwrap();
-            received
-        });
-
-        let front = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let front_addr = front.local_addr().unwrap();
-        let relay = tokio::spawn(async move {
-            let (mut client, _) = front.accept().await.unwrap();
-            let mut up = DirectDialer::default()
-                .connect("127.0.0.1", upstream_addr.port(), T)
-                .await
-                .unwrap();
-            assert!(up.nodelay().unwrap());
-            relay_bidirectional(&mut client, &mut up).await.unwrap()
-        });
-
-        let mut client = TcpStream::connect(front_addr).await.unwrap();
-        client.write_all(&[b'q'; 1234]).await.unwrap();
-        client.shutdown().await.unwrap();
-        let mut reply = Vec::new();
-        client.read_to_end(&mut reply).await.unwrap();
-
-        assert_eq!(relay.await.unwrap(), (1234, 2500));
-        assert_eq!(upstream_task.await.unwrap(), vec![b'q'; 1234]);
-        assert_eq!(reply, vec![b'r'; 2500]);
-    }
-
-    fn assert_keepalive(stream: &TcpStream, ka: &KeepaliveSettings) {
-        let sock = socket2::SockRef::from(stream);
-        assert!(sock.keepalive().unwrap());
-        assert!(stream.nodelay().unwrap());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        {
-            assert_eq!(sock.tcp_keepalive_time().unwrap(), ka.idle);
-            assert_eq!(sock.tcp_keepalive_interval().unwrap(), ka.interval);
-            assert_eq!(sock.tcp_keepalive_retries().unwrap(), ka.retries);
-        }
-    }
-
-    #[tokio::test]
-    async fn direct_dialer_applies_keepalive_settings() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let accept = tokio::spawn(async move {
-            for _ in 0..3 {
-                listener.accept().await.unwrap();
-            }
-        });
-        let ka = KeepaliveSettings {
-            idle: Duration::from_secs(45),
-            interval: Duration::from_secs(7),
-            retries: 4,
-        };
-        let block_other: FilterRule = "203.0.113.0/24".parse().unwrap();
-        let filter = Arc::new(HostFilter::Block(vec![block_other]));
-        let dialers = [
-            DirectDialer::default().with_tcp_keepalive(Some(ka)),
-            DirectDialer::with_filter(Arc::clone(&filter)).with_tcp_keepalive(Some(ka)),
-        ];
-        // Unfiltered, filtered IP literal, and filtered hostname dial paths.
-        for (dialer, host) in [
-            (&dialers[0], "127.0.0.1"),
-            (&dialers[1], "127.0.0.1"),
-            (&dialers[1], "localhost"),
-        ] {
-            let stream = dialer.connect(host, port, T).await.unwrap();
-            assert_keepalive(&stream, &ka);
-        }
-        accept.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn direct_dialer_without_keepalive_leaves_it_off() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let accept = tokio::spawn(async move { listener.accept().await });
-        let stream = DirectDialer::default()
-            .connect("127.0.0.1", port, T)
-            .await
-            .unwrap();
-        assert!(!socket2::SockRef::from(&stream).keepalive().unwrap());
-        accept.await.unwrap().unwrap();
     }
 }

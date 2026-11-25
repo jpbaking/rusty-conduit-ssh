@@ -291,11 +291,10 @@ impl Proxy {
             roots.add(origin_ca).unwrap();
             let upstream = client_config_with_roots(Arc::clone(&provider), roots).unwrap();
             MitmState::build(
-                &cfg,
+                &cfg.mitm_options(),
                 &cfg.ca_source().unwrap(),
                 provider,
                 upstream,
-                Arc::clone(&dialer),
             )
             .unwrap()
         });
