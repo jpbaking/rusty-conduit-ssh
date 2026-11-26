@@ -9,7 +9,7 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Empty};
 use hyper::{Request, Version};
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 use x509_parser::extensions::GeneralName;
@@ -268,11 +268,11 @@ async fn block_web_allows_raw_tcp_and_server_speaks_first() {
 }
 
 #[tokio::test]
-async fn block_web_flag_is_inactive_without_mitm() {
+async fn block_web_flag_is_active_without_mitm() {
     let echo = spawn_echo().await;
     let socks = MockSocks::start().await;
     let opts = ProxyOptions::separate().with_block_web();
-    let proxy = Proxy::start("block-inactive", opts, socks.dialer()).await;
+    let proxy = Proxy::start("block-without-mitm", opts, socks.dialer()).await;
 
     let (mut s, rep) = socks5(
         proxy.socks,
@@ -283,11 +283,14 @@ async fn block_web_flag_is_inactive_without_mitm() {
     .await;
     assert_eq!(rep, 0);
     let req = b"GET / HTTP/1.1\r\nHost: example\r\n\r\n";
-    assert_eq!(roundtrip(&mut s, req).await, req);
+    s.write_all(req).await.unwrap();
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf).await.unwrap();
+    assert!(buf.is_empty(), "blocked HTTP request must receive no reply");
     drop(s);
 
     let lines = proxy.socks_lines(1).await;
-    find(&lines, "status=ok");
-    assert_eq!(echo.received.load(Ordering::SeqCst), req.len());
+    find(&lines, "status=blocked_web_in_mitm");
+    assert_eq!(echo.received.load(Ordering::SeqCst), 0);
     proxy.stop().await;
 }

@@ -319,10 +319,10 @@ pub(crate) fn build_engines_with(
             humantime::format_duration(cfg.mitm_cert_ttl)
         ));
         http = http.with_mitm(Arc::new(m.interceptor.clone()));
-        if cfg.socks_block_web_in_mitm {
-            logger.info("SOCKS web blocking enabled: HTTP/HTTPS over SOCKS is rejected");
-            socks = socks.with_guard(Arc::new(socks::web_guard::WebGuard));
-        }
+    }
+    if cfg.socks_block_web_in_mitm {
+        logger.info("SOCKS web blocking enabled: HTTP/HTTPS over SOCKS is rejected");
+        socks = socks.with_guard(Arc::new(socks::web_guard::WebGuard));
     }
     (http, socks)
 }
@@ -680,7 +680,11 @@ mod tests {
         let (h, s) = build_engines(&cfg, Some(&state), &access, &logger, direct_dialer());
         assert_eq!(guarded(&h, &s), (true, true));
         let (h, s) = build_engines(&cfg, None, &access, &logger, direct_dialer());
-        assert_eq!(guarded(&h, &s), (false, false), "MITM off: flag inactive");
+        assert_eq!(
+            guarded(&h, &s),
+            (false, true),
+            "MITM off: SOCKS web guard still active when flag is set"
+        );
         cfg.socks_block_web_in_mitm = false;
         let (h, s) = build_engines(&cfg, Some(&state), &access, &logger, direct_dialer());
         assert_eq!(guarded(&h, &s), (true, false));

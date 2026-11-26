@@ -185,8 +185,6 @@ pub enum ConfigError {
     ReconnectDelayOrder { initial: Duration, max: Duration },
     #[error("invalid TCP keepalive setting: {0}")]
     InvalidKeepalive(String),
-    #[error("conflicting {scope} filter: cannot set both allowlist and blocklist")]
-    ConflictingFilter { scope: &'static str },
 }
 
 /// Raw command-line / environment input (`clap` derive with `env` fallbacks).
@@ -363,9 +361,19 @@ pub struct CliArgs {
     )]
     pub mitm_cert_cache_max_entries: Option<usize>,
 
-    /// When MITM is ON, reject HTTP/HTTPS traffic over SOCKS4/5
+    /// Reject HTTP/HTTPS traffic over SOCKS4/5 (works with or without MITM)
     #[arg(
         long,
+        env = "RUSTY_CONDUIT_SSH_SOCKS_BLOCK_WEB",
+        action = ArgAction::SetTrue,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub socks_block_web: bool,
+
+    /// Backwards-compatible alias for --socks-block-web
+    #[arg(
+        long = "socks-block-web-in-mitm",
+        hide = true,
         env = "RUSTY_CONDUIT_SSH_SOCKS_BLOCK_WEB_IN_MITM",
         action = ArgAction::SetTrue,
         value_parser = clap::builder::BoolishValueParser::new()
@@ -504,8 +512,10 @@ pub struct CliInput {
     pub args: CliArgs,
     /// `--mitm-ca-passphrase` came from an actual command-line argument (not the env var).
     pub passphrase_from_cli: bool,
-    /// `--socks-block-web-in-mitm` was explicitly provided (CLI or env), so it overrides TOML.
+    /// `--socks-block-web` (or alias `--socks-block-web-in-mitm`) was explicitly provided (CLI or env).
     pub socks_block_web_explicit: bool,
+    /// Resolved CLI/env value for `--socks-block-web` when `socks_block_web_explicit` is true.
+    pub socks_block_web_value: bool,
     /// `--no-reconnect` was explicitly provided (CLI or env), so it overrides TOML.
     pub no_reconnect_explicit: bool,
 }
@@ -539,10 +549,15 @@ impl CliInput {
         let args = CliArgs::from_arg_matches(matches)?;
         let passphrase_from_cli =
             matches.value_source("mitm_ca_passphrase") == Some(ValueSource::CommandLine);
-        let socks_block_web_explicit = matches!(
-            matches.value_source("socks_block_web_in_mitm"),
-            Some(ValueSource::CommandLine | ValueSource::EnvVariable)
-        );
+        let primary_src = matches.value_source("socks_block_web");
+        let legacy_src = matches.value_source("socks_block_web_in_mitm");
+        let (socks_block_web_explicit, socks_block_web_value) = match (primary_src, legacy_src) {
+            (Some(ValueSource::CommandLine), _) => (true, args.socks_block_web),
+            (_, Some(ValueSource::CommandLine)) => (true, args.socks_block_web_in_mitm),
+            (Some(ValueSource::EnvVariable), _) => (true, args.socks_block_web),
+            (_, Some(ValueSource::EnvVariable)) => (true, args.socks_block_web_in_mitm),
+            _ => (false, false),
+        };
         let no_reconnect_explicit = matches!(
             matches.value_source("no_reconnect"),
             Some(ValueSource::CommandLine | ValueSource::EnvVariable)
@@ -551,6 +566,7 @@ impl CliInput {
             args,
             passphrase_from_cli,
             socks_block_web_explicit,
+            socks_block_web_value,
             no_reconnect_explicit,
         })
     }
@@ -571,6 +587,8 @@ pub struct FileConfig {
     pub tcp_keepalive_retries: Option<u32>,
     pub allow: Option<Vec<String>>,
     pub block: Option<Vec<String>>,
+    /// Reject HTTP/HTTPS traffic over SOCKS4/5 (works with or without MITM).
+    pub socks_block_web: Option<bool>,
     #[serde(default)]
     pub mitm: FileMitmConfig,
     #[serde(default)]
@@ -931,10 +949,10 @@ impl Config {
             .transpose()?;
 
         let socks_block_web_in_mitm = if cli.socks_block_web_explicit {
-            a.socks_block_web_in_mitm
+            cli.socks_block_web_value
         } else {
-            file.mitm
-                .socks_block_web
+            file.socks_block_web
+                .or(file.mitm.socks_block_web)
                 .unwrap_or(d.socks_block_web_in_mitm)
         };
 
@@ -1148,35 +1166,17 @@ impl Config {
                 )));
             }
         }
-        if !self.allow.is_empty() && !self.block.is_empty() {
-            return Err(ConfigError::ConflictingFilter { scope: "forward" });
-        }
-        if !self.reverse_allow.is_empty() && !self.reverse_block.is_empty() {
-            return Err(ConfigError::ConflictingFilter { scope: "reverse" });
-        }
         Ok(())
     }
 
     /// The configured forward destination filter, or `None` when unfiltered.
     pub fn forward_filter(&self) -> Option<HostFilter> {
-        if !self.allow.is_empty() {
-            Some(HostFilter::Allow(self.allow.clone()))
-        } else if !self.block.is_empty() {
-            Some(HostFilter::Block(self.block.clone()))
-        } else {
-            None
-        }
+        HostFilter::from_lists(self.allow.clone(), self.block.clone())
     }
 
     /// The configured reverse destination filter, or `None` when unfiltered.
     pub fn reverse_filter(&self) -> Option<HostFilter> {
-        if !self.reverse_allow.is_empty() {
-            Some(HostFilter::Allow(self.reverse_allow.clone()))
-        } else if !self.reverse_block.is_empty() {
-            Some(HostFilter::Block(self.reverse_block.clone()))
-        } else {
-            None
-        }
+        HostFilter::from_lists(self.reverse_allow.clone(), self.reverse_block.clone())
     }
 
     /// The configured MITM CA source, or `None` when MITM mode is OFF.
@@ -1219,11 +1219,6 @@ impl Config {
     /// Whether the bind address is reachable beyond the local host.
     pub fn is_non_loopback_bind(&self) -> bool {
         !self.bind.is_loopback()
-    }
-
-    /// `--socks-block-web-in-mitm` is set but has no effect because MITM is OFF.
-    pub fn socks_block_web_inactive(&self) -> bool {
-        self.socks_block_web_in_mitm && !self.mitm_enabled()
     }
 
     /// Resolve the CA passphrase from the inline value or the passphrase file
@@ -1273,13 +1268,6 @@ impl Config {
                 "NOTICE: --mitm-ca-passphrase was passed on the command line, where it may be \
                  visible to other users and shell history; prefer RUSTY_CONDUIT_SSH_MITM_CA_PASSPHRASE \
                  or --mitm-ca-passphrase-file"
-                    .to_string(),
-            );
-        }
-        if self.socks_block_web_inactive() {
-            out.push(
-                "NOTICE: --socks-block-web-in-mitm is inactive because MITM is disabled \
-                 (no CA configured)"
                     .to_string(),
             );
         }
@@ -1447,6 +1435,7 @@ mod tests {
         "RUSTY_CONDUIT_SSH_MITM_CA_PASSPHRASE",
         "RUSTY_CONDUIT_SSH_MITM_CA_PASSPHRASE_FILE",
         "RUSTY_CONDUIT_SSH_MITM_CERT_TTL",
+        "RUSTY_CONDUIT_SSH_SOCKS_BLOCK_WEB",
         "RUSTY_CONDUIT_SSH_SOCKS_BLOCK_WEB_IN_MITM",
         "RUSTY_CONDUIT_SSH_LOG_LEVEL",
         "RUSTY_CONDUIT_SSH_LOG_FORMAT",
@@ -1687,6 +1676,12 @@ socks_log = "/file/socks.log"
 
     #[test]
     fn socks_block_web_flag_and_env() {
+        let _env = EnvGuard::new(&[("RUSTY_CONDUIT_SSH_SOCKS_BLOCK_WEB", "true")]);
+        let c = cli(&[]);
+        assert!(c.socks_block_web_explicit);
+        assert!(Config::merge(c, None).unwrap().socks_block_web_in_mitm);
+        drop(_env);
+
         let _env = EnvGuard::new(&[("RUSTY_CONDUIT_SSH_SOCKS_BLOCK_WEB_IN_MITM", "true")]);
         let c = cli(&[]);
         assert!(c.socks_block_web_explicit);
@@ -1694,6 +1689,10 @@ socks_log = "/file/socks.log"
         drop(_env);
 
         let _env = EnvGuard::new(&[]);
+        let c = cli(&["--socks-block-web"]);
+        assert!(c.socks_block_web_explicit);
+        assert!(Config::merge(c, None).unwrap().socks_block_web_in_mitm);
+
         let c = cli(&["--socks-block-web-in-mitm"]);
         assert!(c.socks_block_web_explicit);
         assert!(Config::merge(c, None).unwrap().socks_block_web_in_mitm);
@@ -1701,6 +1700,16 @@ socks_log = "/file/socks.log"
         let c = cli(&[]);
         assert!(!c.socks_block_web_explicit);
         let file = FileConfig {
+            socks_block_web: Some(true),
+            ..Default::default()
+        };
+        assert!(
+            Config::merge(c.clone(), Some(file))
+                .unwrap()
+                .socks_block_web_in_mitm
+        );
+
+        let legacy_file = FileConfig {
             mitm: FileMitmConfig {
                 socks_block_web: Some(true),
                 ..Default::default()
@@ -1708,7 +1717,7 @@ socks_log = "/file/socks.log"
             ..Default::default()
         };
         assert!(
-            Config::merge(c, Some(file))
+            Config::merge(c, Some(legacy_file))
                 .unwrap()
                 .socks_block_web_in_mitm
         );
@@ -1909,14 +1918,14 @@ socks_log = "/file/socks.log"
     }
 
     #[test]
-    fn notice_socks_block_web_without_mitm() {
+    fn socks_block_web_works_without_mitm_no_inactive_notice() {
         let _env = EnvGuard::new(&[]);
-        let cfg = load(&["--socks-block-web-in-mitm"]).unwrap();
-        assert!(cfg.socks_block_web_inactive());
-        assert!(cfg.notices().iter().any(|n| n.contains("inactive")));
+        let cfg = load(&["--socks-block-web"]).unwrap();
+        assert!(cfg.socks_block_web_in_mitm);
+        assert!(cfg.notices().is_empty());
 
-        let cfg = load(&["--socks-block-web-in-mitm", "--mitm-ca-p12", "a.p12"]).unwrap();
-        assert!(!cfg.socks_block_web_inactive());
+        let cfg = load(&["--socks-block-web-in-mitm"]).unwrap();
+        assert!(cfg.socks_block_web_in_mitm);
         assert!(cfg.notices().is_empty());
     }
 
@@ -2593,27 +2602,29 @@ extra_args = ["-o", "Compression=yes"]
         assert!(s.contains("filter=allow(3)"), "{s}");
         assert!(s.contains("reverse_filter=block(3)"), "{s}");
 
-        // Mutual exclusion: forward allow + block
-        let err = load(&["--allow", "example.com", "--block", "127.0.0.1"]).unwrap_err();
-        assert!(
-            matches!(err, ConfigError::ConflictingFilter { scope: "forward" }),
-            "{err:?}"
-        );
+        // Combined forward allow + block: allowlist serves as exceptions to blocklist
+        let cfg = load(&["--allow", "test.domain.net", "--block", "*.domain.net"]).unwrap();
+        assert!(matches!(
+            cfg.forward_filter(),
+            Some(HostFilter::BlockExcept { .. })
+        ));
+        assert!(cfg.summary().contains("filter=block-except(2)"));
 
-        // Mutual exclusion: reverse allow + block
-        let err = load(&[
+        // Combined reverse allow + block: allowlist serves as exceptions to blocklist
+        let cfg = load(&[
             "--reverse-http-port",
             "8888",
             "--reverse-allow",
-            "example.com",
+            "test.domain.net",
             "--reverse-block",
-            "127.0.0.1",
+            "*.domain.net",
         ])
-        .unwrap_err();
-        assert!(
-            matches!(err, ConfigError::ConflictingFilter { scope: "reverse" }),
-            "{err:?}"
-        );
+        .unwrap();
+        assert!(matches!(
+            cfg.reverse_filter(),
+            Some(HostFilter::BlockExcept { .. })
+        ));
+        assert!(cfg.summary().contains("reverse_filter=block-except(2)"));
 
         // TOML parsing + env override
         let toml_path = temp_file(
@@ -2637,7 +2648,7 @@ block = ["127.0.0.0/8", "::1"]
         assert_eq!(cfg.allow.len(), 2);
         assert_eq!(cfg.reverse_block.len(), 2);
 
-        // Cross-source conflict (TOML allow + CLI block) is rejected
+        // Cross-source combination (TOML allow + CLI block) produces BlockExcept
         let cli = CliInput::try_parse_from([
             "rusty-conduit-ssh",
             "--config",
@@ -2647,9 +2658,10 @@ block = ["127.0.0.0/8", "::1"]
         ])
         .unwrap();
         let cfg = Config::from_cli(cli).unwrap();
+        cfg.validate().unwrap();
         assert!(matches!(
-            cfg.validate(),
-            Err(ConfigError::ConflictingFilter { scope: "forward" })
+            cfg.forward_filter(),
+            Some(HostFilter::BlockExcept { .. })
         ));
         let _ = fs::remove_file(&toml_path);
     }
