@@ -812,6 +812,7 @@ impl MockSsh {
         let script = format!(
             "#!/bin/sh\n\
              [ \"$1\" = \"--probe\" ] && exit 0\n\
+             [ \"$1\" = \"-G\" ] && exit 0\n\
              trap 'echo term >> \"{d}/terms\"; sleep {seconds}; exit 0' TERM\n\
              printf '%s\\n' \"$@\" > '{d}/args'\n\
              echo \"$$\" >> '{d}/pids'\n\

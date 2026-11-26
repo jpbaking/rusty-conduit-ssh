@@ -99,6 +99,7 @@ docker run -d --name rusty-conduit-ssh --restart unless-stopped \
 - **On a Linux host**, add `--user "$(id -u):$(id -g)"` so the container can read your files ([section 2](#file-ownership)).
 - **Memory:** the image sets `MALLOC_ARENA_MAX=2`, which keeps memory low on hosts with many CPUs. Leave it in place unless you measure otherwise; see [Performance, Footprint & Sizing](PERFORMANCE-AND-SIZING.md#memory-on-many-core-linux-malloc_arena_max).
 - **The SSH server must be reachable from the container.** A server on the Docker host is `host.docker.internal` (on Linux, add `--add-host host.docker.internal:host-gateway`); `127.0.0.1` is the container itself.
+- **While you set things up**, use `--restart on-failure:5` instead of `unless-stopped`. A broken configuration then stops after five failed starts instead of restarting forever; switch to `unless-stopped` once it runs. Failed logins that only the server can reject, such as a key it does not accept, are otherwise retried on every restart.
 - **Stop:** `docker stop rusty-conduit-ssh` sends `SIGTERM`. Connections drain for up to 5 seconds, then `ssh` is stopped; the whole shutdown fits well inside Docker's default 10-second grace period.
 
 ---
@@ -115,15 +116,17 @@ docker run -d --name rusty-conduit-ssh \
   ghcr.io/jpbaking/rusty-conduit-ssh:2 --config /etc/rusty-conduit-ssh/config.toml
 ```
 
-Check it before starting; `validate` does not start `ssh`:
+Check it before starting, with the same mounts and user as the proxy. `validate` reads the SSH files and runs `ssh -G`, but never connects:
 
 ```sh
-docker run --rm -v "$PWD/conf:/etc/rusty-conduit-ssh:ro" \
+docker run --rm \
+  -v "$PWD/ssh:/ssh:ro" \
+  -v "$PWD/conf:/etc/rusty-conduit-ssh:ro" \
   ghcr.io/jpbaking/rusty-conduit-ssh:2 validate --config /etc/rusty-conduit-ssh/config.toml
 # config OK: /etc/rusty-conduit-ssh/config.toml target=my-bastion
 ```
 
-`validate` checks the settings, not the files they name: an unreadable key or CA still passes, and fails only when the proxy starts. See the [Advanced User Guide](USER-GUIDE-ADVANCED.md) for every key; `ssh.config` is the file form of `-F`.
+To check only the settings, for example before the SSH files are in place, add `--settings-only`. See the [Advanced User Guide](USER-GUIDE-ADVANCED.md) for every key; `ssh.config` is the file form of `-F`.
 
 ---
 
@@ -247,7 +250,7 @@ services:
 Check the target and flags with the same mounts before starting:
 
 ```sh
-docker compose run --rm --no-deps rusty-conduit-ssh validate my-bastion
+docker compose run --rm --no-deps rusty-conduit-ssh -F /ssh/config validate my-bastion
 ```
 
 ### 9.2 Settings in a config file

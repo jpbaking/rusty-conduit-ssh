@@ -213,7 +213,7 @@ rusty-conduit-ssh my-bastion --bind 0.0.0.0
 rusty-conduit-ssh validate my-bastion --config proxy.toml
 ```
 
-This checks the settings without starting `ssh` or binding any listener.
+This checks the settings, the files they name, and the SSH config (with `ssh -G`), without connecting to the SSH server or binding any listener. Add `--settings-only` to check only the settings.
 
 ---
 

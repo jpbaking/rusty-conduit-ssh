@@ -108,7 +108,7 @@ Diagnostics go to `stderr`. At `DEBUG` and `VERBOSE`, access and SOCKS records a
 
 ### Checking a configuration
 
-Use the `validate` subcommand to load, merge, and validate CLI flags, environment variables, and `--config` without starting `ssh` or binding any listener:
+Use the `validate` subcommand to load, merge, and validate CLI flags, environment variables, and `--config` without connecting to the SSH server or binding any listener:
 
 ```sh
 rusty-conduit-ssh validate myhost --config proxy.toml
@@ -119,8 +119,11 @@ Other flags go before the subcommand; only `--config` may follow it.
 
 - On success, it prints `config OK: <path|none> target=<target>` (followed by any startup `NOTICE:` lines) to `stdout` and exits `0`.
 - On failure, it prints `config invalid: <error>` to `stderr` and exits `1`.
-- It checks settings, not the files they name. An unreadable CA key, identity file, or log path still passes `validate` and fails at startup.
+- It also checks what startup checks before launching `ssh`: the MITM CA (files, passphrase, validity, and that the key matches the certificate), that each log file can be opened (without creating it), that the `ssh` program exists, that the `-i` key and `-F` config can be read, and that `ssh -G` accepts the configuration for the target. `ssh -G` evaluates the SSH config and exits without connecting. It prints the open-file `NOTICE` startup would log, too.
+- `--settings-only` skips those checks, for checking a config away from the host it runs on, for example in CI: `rusty-conduit-ssh validate myhost --settings-only --config proxy.toml`.
 - If you have an SSH host alias literally named `validate`, pass it with `--target validate` so it is not parsed as the subcommand.
+
+Startup runs the same checks before it launches `ssh`. A missing key, an unreadable or broken SSH config, or a bad CA stops the proxy at once with one `FATAL` line, instead of turning into failed logins and reconnects against the SSH server.
 
 **Exit codes:** `0` for a clean exit, `1` for a fatal startup or runtime error, and `2` for a command-line usage error.
 

@@ -8,7 +8,7 @@
 use std::fmt;
 use std::io;
 use std::net::{IpAddr, SocketAddr, TcpListener};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
@@ -193,6 +193,122 @@ pub fn build_ssh_args(cfg: &SshTunnelConfig, socks_addr: SocketAddr) -> Vec<Stri
     args.push("--".into());
     args.push(cfg.target.clone());
     args
+}
+
+/// How long `ssh -G` may take; a `Match exec` block in the SSH config can run commands.
+const SSH_CONFIG_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Offline checks of the `ssh` setup, run by `validate` and before the first `ssh` starts:
+/// the program exists, the `-i` and `-F` files can be read, and `ssh -G` accepts the
+/// configuration for the target. Nothing connects to the SSH server.
+pub fn check_ssh_setup(cfg: &SshTunnelConfig) -> Result<(), String> {
+    let program = find_program(&cfg.ssh_bin)?;
+    if let Some(identity) = &cfg.identity {
+        std::fs::File::open(identity)
+            .map_err(|e| format!("cannot read --ssh-identity {}: {e}", identity.display()))?;
+    }
+    if let Some(config_file) = &cfg.config_file {
+        std::fs::File::open(config_file)
+            .map_err(|e| format!("cannot read --ssh-config {}: {e}", config_file.display()))?;
+    }
+    check_ssh_config(&program, cfg)
+}
+
+/// Resolve the `ssh` program the supervisor will run: a path is checked as is, and a bare
+/// name is searched for on `PATH`.
+fn find_program(bin: &Path) -> Result<PathBuf, String> {
+    if bin.components().count() > 1 {
+        return if is_executable(bin) {
+            Ok(bin.to_path_buf())
+        } else if bin.exists() {
+            Err(format!("--ssh-bin {} is not executable", bin.display()))
+        } else {
+            Err(format!("--ssh-bin {} does not exist", bin.display()))
+        };
+    }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(bin);
+        if is_executable(&candidate) {
+            return Ok(candidate);
+        }
+        if cfg!(windows) && candidate.extension().is_none() {
+            let exe = candidate.with_extension("exe");
+            if is_executable(&exe) {
+                return Ok(exe);
+            }
+        }
+    }
+    Err(format!(
+        "`{}` was not found on PATH; install an OpenSSH client or set --ssh-bin",
+        bin.display()
+    ))
+}
+
+fn is_executable(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.is_file() && meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        meta.is_file()
+    }
+}
+
+/// Run `ssh -G` with the same arguments as the real launch. It evaluates the SSH config for
+/// the target and exits without connecting.
+fn check_ssh_config(program: &Path, cfg: &SshTunnelConfig) -> Result<(), String> {
+    let placeholder = SocketAddr::new(cfg.socks_bind, 1);
+    let mut child = std::process::Command::new(program)
+        .arg("-G")
+        .args(build_ssh_args(cfg, placeholder))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to start {}: {e}", program.display()))?;
+    let deadline = std::time::Instant::now() + SSH_CONFIG_CHECK_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "`ssh -G` did not finish within {}s while checking the SSH configuration",
+                    SSH_CONFIG_CHECK_TIMEOUT.as_secs()
+                ));
+            }
+            Err(e) => return Err(format!("`ssh -G` failed: {e}")),
+        }
+    };
+    if status.success() {
+        return Ok(());
+    }
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        use std::io::Read;
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    let detail = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(if detail.is_empty() {
+        format!("`ssh -G` rejected the SSH configuration ({status})")
+    } else {
+        format!("`ssh -G` rejected the SSH configuration: {detail}")
+    })
 }
 
 /// Round up, because `ssh` takes whole seconds and `0` would disable keepalives.

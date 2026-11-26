@@ -190,11 +190,17 @@ pub enum ConfigError {
 /// Subcommands. Without one, the proxy runs.
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum Command {
-    /// Validate the configuration (flags, environment, and --config file) and exit 0/1
+    /// Validate the configuration (flags, environment, and --config file), the files it names
+    /// (MITM CA, log paths, SSH key and config), and `ssh -G` for the target, then exit 0/1.
+    /// Never connects to the SSH server
     Validate {
         /// SSH destination to validate with (same as the positional TARGET)
         #[arg(value_name = "TARGET")]
         target: Option<String>,
+        /// Check the settings only; skip the files they name and `ssh -G` (for checking a
+        /// config away from the host it runs on)
+        #[arg(long)]
+        settings_only: bool,
     },
 }
 

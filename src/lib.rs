@@ -10,6 +10,7 @@
 pub mod config;
 pub mod fdlimit;
 pub mod net;
+pub mod preflight;
 pub mod reverse;
 pub mod ssh;
 #[cfg(test)]
@@ -171,6 +172,17 @@ pub async fn run_until(cfg: Config, logger: Logger, interrupted: CancellationTok
             return ExitCode::from(EXIT_FATAL);
         }
     };
+
+    // Fail on local problems before `ssh` starts, so a bad CA, key, or SSH config never
+    // costs a connection attempt (or a retry loop) against the SSH server.
+    if let Err(e) = preflight_before_ssh(&cfg, &tunnel_cfg) {
+        logger.fatal(e);
+        if let Err(e) = access.shutdown().await {
+            logger.error(format!("failed to flush access logs: {e}"));
+        }
+        logger.flush();
+        return ExitCode::from(EXIT_FATAL);
+    }
 
     // Bound before `ssh` starts so the `-R` targets are known and survive reconnects.
     let reverse = match ReverseProxy::start(&cfg, &access, &logger).await {
@@ -385,13 +397,50 @@ pub async fn shutdown_signal(logger: &Logger) {
     }
 }
 
-/// `validate [TARGET]`: exit 0 when the configuration is valid, 1 otherwise.
+/// The offline checks startup would fail on before launching `ssh` (see [`preflight`]):
+/// the MITM CA and the `ssh` setup. Nothing connects to the SSH server.
+pub fn preflight_before_ssh(cfg: &Config, tunnel: &SshTunnelConfig) -> Result<(), String> {
+    preflight::check_mitm(&cfg.mitm_options())?;
+    ssh::check_ssh_setup(tunnel)
+}
+
+/// Every offline check startup would fail on, in startup order: the access logs, then
+/// [`preflight_before_ssh`].
+pub fn preflight_checks(cfg: &Config) -> Result<(), String> {
+    let tunnel = SshTunnelConfig::from_config(cfg).map_err(|e| e.to_string())?;
+    if let Some(path) = &cfg.http_access_log {
+        preflight::check_log_path("--http-access-log", path)?;
+    }
+    if let Some(path) = &cfg.socks_log {
+        preflight::check_log_path("--socks-log", path)?;
+    }
+    preflight_before_ssh(cfg, &tunnel)
+}
+
+/// `validate [TARGET] [--settings-only]`: exit 0 when the configuration is valid, 1 otherwise.
+///
+/// Without `--settings-only`, it also runs the [`preflight_checks`] and reports the
+/// open-file limit as startup would.
 pub fn cmd_validate(mut cli: CliInput, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
-    if let Some(Command::Validate { target: Some(t) }) = cli.args.command.take() {
-        cli.args.target = Some(t);
+    let mut settings_only = false;
+    if let Some(Command::Validate {
+        target,
+        settings_only: only,
+    }) = cli.args.command.take()
+    {
+        settings_only = only;
+        if let Some(t) = target {
+            cli.args.target = Some(t);
+        }
     }
     match load_config(cli) {
         Ok(cfg) => {
+            if !settings_only {
+                if let Err(e) = preflight_checks(&cfg) {
+                    let _ = writeln!(err, "config invalid: {e}");
+                    return EXIT_FATAL;
+                }
+            }
             let path = cfg
                 .config_path
                 .as_ref()
@@ -401,6 +450,12 @@ pub fn cmd_validate(mut cli: CliInput, out: &mut dyn Write, err: &mut dyn Write)
             let _ = writeln!(out, "config OK: {path} target={target}");
             for notice in cfg.notices() {
                 let _ = writeln!(out, "{notice}");
+            }
+            if !settings_only {
+                let (connections, flag) = fd_budget(&cfg);
+                if let Some(notice) = preflight::fd_limit_notice(connections, flag) {
+                    let _ = writeln!(out, "{notice}");
+                }
             }
             0
         }

@@ -74,3 +74,71 @@ fn unknown_flag_exits_two() {
     let (code, _, _) = run(&["example.test", "--no-such-flag"]);
     assert_eq!(code, Some(2));
 }
+
+fn ssh_on_path() -> bool {
+    Command::new("ssh").arg("-V").output().is_ok()
+}
+
+#[test]
+fn validate_checks_the_ssh_program_unless_settings_only() {
+    let args = ["--ssh-bin", "/nonexistent/ssh", "validate", "example.test"];
+    let (code, _, err) = run(&args);
+    assert_eq!(code, Some(1));
+    assert!(
+        err.starts_with("config invalid: --ssh-bin /nonexistent/ssh does not exist"),
+        "{err}"
+    );
+    let (code, _, err) = run(&[&args[..], &["--settings-only"]].concat());
+    assert_eq!(code, Some(0), "{err}");
+}
+
+#[test]
+fn validate_checks_the_identity_file() {
+    if !ssh_on_path() {
+        return;
+    }
+    let (code, _, err) = run(&["-i", "/nonexistent/id_ed25519", "validate", "example.test"]);
+    assert_eq!(code, Some(1));
+    assert!(
+        err.starts_with("config invalid: cannot read --ssh-identity /nonexistent/id_ed25519"),
+        "{err}"
+    );
+}
+
+#[test]
+fn validate_runs_ssh_g_on_the_ssh_config() {
+    if !ssh_on_path() {
+        return;
+    }
+    let bad = TempFile::new("bad-ssh-config", "Host x\n    Bogus yes\n");
+    let (code, _, err) = run(&["-F", bad.path(), "validate", "x"]);
+    assert_eq!(code, Some(1));
+    assert!(
+        err.starts_with("config invalid: `ssh -G` rejected the SSH configuration:"),
+        "{err}"
+    );
+    assert!(err.to_lowercase().contains("bogus"), "{err}");
+
+    let good = TempFile::new("good-ssh-config", "Host x\n    HostName example.test\n");
+    let (code, out, err) = run(&["-F", good.path(), "validate", "x"]);
+    assert_eq!(code, Some(0), "{err}");
+    assert!(out.starts_with("config OK: none target=x"), "{out}");
+}
+
+#[test]
+fn validate_checks_the_mitm_ca_files_unless_settings_only() {
+    let ca = [
+        "--mitm-ca-cert",
+        "/nonexistent/ca.pem",
+        "--mitm-ca-key",
+        "/nonexistent/ca.key",
+    ];
+    let (code, _, err) = run(&[&ca[..], &["validate", "example.test"]].concat());
+    assert_eq!(code, Some(1));
+    assert!(
+        err.starts_with("config invalid: MITM setup failed:"),
+        "{err}"
+    );
+    let (code, _, err) = run(&[&ca[..], &["validate", "example.test", "--settings-only"]].concat());
+    assert_eq!(code, Some(0), "{err}");
+}
