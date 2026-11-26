@@ -220,10 +220,10 @@ rusty-conduit-ssh: a single Rust crate (library `rusty_conduit_ssh` + binary `ru
 - **Engine split.** The protocol front end (listeners, mux, HTTP/HTTPS, SOCKS, MITM, filter, logging, routing, dialers) lives in the external `rusty-conduit-engine` crate, pinned by git tag in `Cargo.toml` and re-exported from `src/lib.rs` under the historical module paths. This crate owns only the CLI/TOML config, the `ssh` supervisor, the tunnel dialer, the reverse proxy, and app lifecycle. Change protocol behavior in the engine, not here; bump the tag in `Cargo.toml` to pick it up.
 - **No local DNS on the forward path.** Forward traffic must always route to the `TUNNEL_PROFILE` and pass hostnames unresolved (`ATYP=0x03`). Never add a code path that resolves a proxied hostname locally.
 - **Reverse path never uses the tunnel.** The reverse proxy egresses only through the engine's `direct` profile, with its own MITM state, certificate cache, filter, and connection cap, so traffic cannot loop back to the SSH target.
-- **Config precedence** is CLI flags > `RUSTY_CONDUIT_SSH_*` env vars > `--config` TOML > defaults. A new option needs a CLI flag with `env` fallback, a `FileConfig` field, merge + validation in `src/config.rs`, and a `docs/USER-GUIDE.md` reference entry.
+- **Config precedence** is CLI flags > `RUSTY_CONDUIT_SSH_*` env vars > `--config` TOML > defaults. A new option needs a CLI flag with `env` fallback, a `FileConfig` field, merge + validation in `src/config.rs`, and a `docs/USER-GUIDE-ADVANCED.md` reference entry.
 - **Shutdown order** is fixed: drain forward server (while `ssh -D` is up) → stop `ssh` (ends `-R`) → drain reverse server → flush access logs.
 - **TLS stays pure Rust** (`rustls` + `ring`); do not introduce OpenSSL or aws-lc.
-- **User-facing docs.** `README.md` and `docs/USER-GUIDE.md` are end-user docs shipped in release archives; keep them in step with CLI/behavior changes.
+- **User-facing docs.** `README.md` and `docs/` (`USER-GUIDE-BASIC.md`, `USER-GUIDE-ADVANCED.md`, `MITM-CA-GUIDE.md`, `PERFORMANCE-AND-SIZING.md`, `DOCKER-GUIDE.md`) are end-user docs; release archives ship `README.md`, `LICENSE`, and the whole `docs/` folder. Keep them in step with CLI/behavior changes and the `Dockerfile`.
 - **Tests.** Integration tests in `tests/` share the harness `tests/common/mod.rs`: a mock `ssh -D` SOCKS5 listener that records every dial and maps every domain to loopback, plus a mock `ssh` executable. Use reserved `.test` hostnames so success proves remote resolution. `filter_proxy.rs`, `reverse_proxy.rs`, and `ssh_tunnel_proxy.rs` are Unix-only (`#![cfg(unix)]`). Crate-internal unit tests use `src/test_support.rs`.
 
 ### Verification
@@ -245,7 +245,7 @@ When the user requests a durable behavior change, record it here or in the relev
 
 - **CLI entry and app lifecycle** — parses CLI/env, dispatches `validate`, loads config, starts the tunnel, forward and reverse servers, handles signals, and shuts down in order. Start: `src/main.rs`. Files: `src/lib.rs` (`main_entry`, `run`, `run_until`, `serve`, `shutdown_signal`).
 - **`validate` subcommand** — loads and validates the configuration without starting ssh and exits 0/1. Start: `src/lib.rs` (`cmd_validate`). Files: `src/config.rs` (`Command`), `tests/validate_cmd.rs`.
-- **Configuration** — merges CLI > env > TOML > defaults, validates, and derives engine settings (filters, MITM options, keepalive, startup summary). Start: `src/config.rs`. Files: `docs/USER-GUIDE.md` (user reference).
+- **Configuration** — merges CLI > env > TOML > defaults, validates, and derives engine settings (filters, MITM options, keepalive, startup summary). Start: `src/config.rs`. Files: `docs/USER-GUIDE-ADVANCED.md` (user reference).
 - **Open-file limit** — raises the soft `RLIMIT_NOFILE` at startup and logs a NOTICE when it cannot hold the forward plus reverse caps. Start: `src/fdlimit.rs`. Files: `src/lib.rs` (`fd_budget`, `run_until`), `Cargo.toml` (`rlimit`).
 - **SSH tunnel supervisor** — runs `ssh -N -T -4 -D`, probes SOCKS readiness, publishes tunnel state, reconnects with exponential backoff or stops the app under `--no-reconnect`, adds `-R` forwards. Start: `src/ssh.rs`. Files: `src/net.rs` (`TunnelState`).
 - **Tunnel dialer (remote DNS)** — speaks SOCKS5 to the local `ssh -D` listener, sending hostnames unresolved; registered as the `external` `TUNNEL_PROFILE` that all forward traffic routes to. Start: `src/net.rs`. Files: `src/lib.rs` (`forward_routing`, `TUNNEL_PROFILE`).
@@ -253,10 +253,11 @@ When the user requests a durable behavior change, record it here or in the relev
 - **Reverse proxy (`ssh -R`)** — second engine server on an ephemeral loopback port, published on the SSH target, egressing directly with its own filter, MITM state, and connection cap. Start: `src/reverse.rs`. Files: `src/ssh.rs` (`ReverseForward`), `src/lib.rs`, `src/config.rs`.
 - **Destination allow/block filtering** — forward filter checked by the router on the requested name/IP (no local DNS); reverse filter checked by the direct dialer on the name and every resolved IP. Start: `src/config.rs` (`forward_filter`, `reverse_filter`). Files: `src/lib.rs` (`forward_routing`), `src/reverse.rs` (`reverse_routing`).
 - **HTTPS MITM (opt-in)** — PEM or PKCS#12 CA, leaf-cert TTL and cache cap; interception itself is in the engine. Start: `src/config.rs` (`mitm_options`, `mitm_enabled`). Files: `src/lib.rs` (`serve`, `build_engines`), `src/reverse.rs`.
-- **SOCKS web blocking** — `--socks-block-web` (alias `--socks-block-web-in-mitm`) rejects HTTP/HTTPS over SOCKS. Start: `src/config.rs`. Files: `src/lib.rs` (`build_engines_with`).
+- **SOCKS web blocking** — `--socks-block-web` rejects HTTP/HTTPS over SOCKS. Start: `src/config.rs`. Files: `src/lib.rs` (`build_engines_with`).
 - **Logging and access logs** — six log levels, `text`/`json` access logs tagged by forward/reverse direction, no routing fields. Start: `src/lib.rs` (`access_log_config`, `log_startup`). Files: `src/config.rs`.
 - **TCP keepalive** — idle/interval/retries applied to forward and reverse client and upstream sockets. Start: `src/config.rs` (`tcp_keepalive_settings`). Files: `src/lib.rs`, `src/reverse.rs`.
 - **Packaging and release** — CI lint/test/docker build; tagged releases build six platform archives, SHA256SUMS, and a multi-arch GHCR image. Start: `.github/workflows/release.yml`. Files: `.github/workflows/ci.yml`, `Dockerfile`, `.dockerignore`.
+- **User documentation** — marketing README with quick start, basic and advanced user guides, MITM CA guide, sizing, and Docker guide. Start: `README.md`. Files: `docs/`, `LICENSE`.
 - **Test harnesses** — unit-test helpers and the integration mock `ssh`/`ssh -D` harness. Start: `tests/common/mod.rs`. Files: `src/test_support.rs`, `tests/`.
 - **CLI family contract** — test that shared flags keep the family's names, value names, env vars, help text, and defaults. Start: `tests/cli_contract.rs`.
 

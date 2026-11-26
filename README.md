@@ -27,12 +27,12 @@
 Download a prebuilt binary from **[Releases](https://github.com/jpbaking/rusty-conduit-ssh/releases)**, run with Docker (includes `openssh-client` and `ca-certificates` on Ubuntu 26.04 LTS), or build from source with Rust (requires an OpenSSH `ssh` client at runtime):
 
 ```sh
-# Docker (multi-arch: linux/amd64, linux/arm64; binds 0.0.0.0 inside container)
+# Docker (multi-arch: linux/amd64, linux/arm64); see the Docker Guide for the ssh/ directory
 docker run --rm \
   -p 127.0.0.1:3128:3128 \
   -p 127.0.0.1:1080:1080 \
-  -v ~/.ssh:/home/rusty-conduit-ssh/.ssh:ro \
-  ghcr.io/jpbaking/rusty-conduit-ssh:latest my-bastion
+  -v "$PWD/ssh:/ssh:ro" \
+  ghcr.io/jpbaking/rusty-conduit-ssh:1 my-bastion -F /ssh/config
 
 # Or build from source
 cargo install --path .
@@ -119,7 +119,7 @@ curl --socks5-hostname 127.0.0.1:8888 https://example.com/
 ## Security notes
 
 - v1 has **no proxy authentication**. Keep the default loopback bind, or restrict access with a firewall if you use `--bind` with another address.
-- The **reverse proxy** lets anyone who can reach its remote port connect to whatever your machine can reach, **including services on your loopback interface and LAN**. Keep the default `--reverse-bind 127.0.0.1`, and enable it only on SSH targets whose local users you trust. The SSH server has the final say on the bind address: with `GatewayPorts yes` in its `sshd_config`, it listens on **all interfaces even when you request `127.0.0.1`**. Use `GatewayPorts clientspecified` on those targets. See the [User Guide](docs/USER-GUIDE.md#security) for details.
+- The **reverse proxy** lets anyone who can reach its remote port connect to whatever your machine can reach, **including services on your loopback interface and LAN**. Keep the default `--reverse-bind 127.0.0.1`, and enable it only on SSH targets whose local users you trust. The SSH server has the final say on the bind address: with `GatewayPorts yes` in its `sshd_config`, it listens on **all interfaces even when you request `127.0.0.1`**. Use `GatewayPorts clientspecified` on those targets. See the [Advanced User Guide](docs/USER-GUIDE-ADVANCED.md#security) for details.
 - Your machine still resolves the **SSH target's own hostname**, because `ssh` must reach it before the tunnel exists.
 - MITM decrypts traffic. Only use it on systems and traffic you are authorized to inspect, and protect the CA private key.
 
@@ -127,7 +127,13 @@ curl --socks5-hostname 127.0.0.1:8888 https://example.com/
 
 ## Documentation
 
-See the **[User Guide](docs/USER-GUIDE.md)** for the full CLI, environment, and TOML reference, SSH authentication tips, reconnect tuning, the reverse proxy, and HTTPS MITM setup.
+| Guide | What's inside |
+| :--- | :--- |
+| **[Basic User Guide](docs/USER-GUIDE-BASIC.md)** | Installing, connecting browsers and CLI tools, SSH login basics, everyday options, and sharing your connection with the SSH target |
+| **[Advanced User Guide](docs/USER-GUIDE-ADVANCED.md)** | Full CLI/env/TOML reference, SSH launch details, reconnect and keepalive tuning, DNS behavior, HTTPS MITM, the reverse proxy, logging, and a security checklist |
+| **[MITM CA Guide](docs/MITM-CA-GUIDE.md)** | Generating your own PEM or PKCS#12 CA with `openssl` and trusting it on Linux, macOS, Windows, and Firefox |
+| **[Performance, Footprint & Sizing](docs/PERFORMANCE-AND-SIZING.md)** | Measured CPU/RAM footprint of the proxy and its `ssh` process, `ulimit -n` and `somaxconn` limits, sizing, and resource caps |
+| **[Docker Guide](docs/DOCKER-GUIDE.md)** | Images, giving the container its SSH files, `docker run` and Compose examples, the reverse proxy, MITM, limits, and health checks |
 
 ---
 

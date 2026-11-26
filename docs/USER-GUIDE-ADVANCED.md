@@ -1,10 +1,15 @@
-# User Guide
+# Advanced User Guide & Configuration Reference
 
-This guide covers configuring and operating `rusty-conduit-ssh`. For an overview and quick start, see the [README](../README.md).
+This guide covers configuring and operating `rusty-conduit-ssh` in depth: configuration precedence and the full reference, SSH launch details, reconnect and keepalive tuning, DNS behavior, HTTPS MITM, the reverse proxy, logging, and a security checklist.
+
+- New to `rusty-conduit-ssh`? Start with the **[Basic User Guide](USER-GUIDE-BASIC.md)**.
+- For RAM/CPU budgets, `ulimit -n` and `somaxconn` limits, and cap mechanics, see **[Performance, Footprint & Sizing](PERFORMANCE-AND-SIZING.md)**.
+- For creating and trusting a private CA, see the **[MITM CA Guide](MITM-CA-GUIDE.md)**.
+- For containers and Compose, see the **[Docker Guide](DOCKER-GUIDE.md)**.
 
 ---
 
-## 1. How configuration works
+## 1. Configuration precedence and reference
 
 Settings are merged with strict precedence:
 
@@ -16,10 +21,6 @@ Settings are merged with strict precedence:
 - Boolean environment variables accept values such as `true`/`false`, `1`/`0`, `yes`/`no`, and `on`/`off`. Setting one to a false value overrides `true` in the TOML file.
 - Unknown TOML keys are rejected at startup.
 - Extra `ssh` arguments given after `--` **replace** `ssh.extra_args`. They are not appended to it.
-
----
-
-## 2. CLI, environment, and TOML reference
 
 Environment variable names below omit the `RUSTY_CONDUIT_SSH_` prefix. For example, `BIND` means `RUSTY_CONDUIT_SSH_BIND`.
 
@@ -59,7 +60,7 @@ At least one forward or reverse listener must be enabled. Setting both ports to 
 
 CLI flags may be repeated or comma-separated (e.g. `--reverse-block 127.0.0.0/8,::1,*.internal`). Wildcards use a leading `*.` prefix and match subdomains only (`*.example.com` matches `api.example.com`, not bare `example.com`). Blocked requests return HTTP `403 Forbidden`, SOCKS5 `0x02` (`not_allowed`), or SOCKS4 `0x5B`. On the **reverse** path, hostnames are resolved locally before connecting so IP/CIDR rules also catch hostnames that resolve to blocked IPs (e.g. `localhost` → `127.0.0.1`). On the **forward** path, DNS remains remote-only, so FQDN rules match domain requests and IP/CIDR rules match literal IP requests.
 
-See [Reverse proxy](#8-reverse-proxy-ssh--r) for behavior and security guidance.
+See [Reverse proxy](#7-reverse-proxy-ssh--r) for behavior and security guidance.
 
 ### SSH tunnel
 
@@ -92,7 +93,7 @@ See [Reverse proxy](#8-reverse-proxy-ssh--r) for behavior and security guidance.
 | `--mitm-ca-passphrase-file <PATH>` | `MITM_CA_PASSPHRASE_FILE` | `mitm.ca_passphrase_file` | none | File holding the passphrase, trailing newline trimmed |
 | `--mitm-cert-ttl <DURATION>` | `MITM_CERT_TTL` | `mitm.cert_ttl` | `1h` | Leaf certificate TTL, minimum `10s` |
 | `--mitm-cert-cache-max-entries <N>` | `MITM_CERT_CACHE_MAX_ENTRIES` | `mitm.cert_cache_max_entries` | `10240` | Leaf cache cap, `0` = unlimited |
-| `--socks-block-web` | `SOCKS_BLOCK_WEB` | `socks_block_web` | `false` | Reject HTTP/HTTPS traffic over SOCKS4/4a/5 (works with or without MITM). The old names `--socks-block-web-in-mitm` and `mitm.socks_block_web` still work |
+| `--socks-block-web` | `SOCKS_BLOCK_WEB` | `socks_block_web` | `false` | Reject HTTP/HTTPS traffic over SOCKS4/4a/5 (works with or without MITM). |
 
 ### Logging
 
@@ -105,9 +106,27 @@ See [Reverse proxy](#8-reverse-proxy-ssh--r) for behavior and security guidance.
 
 Diagnostics go to `stderr`. At `DEBUG` and `VERBOSE`, access and SOCKS records are also written to `stdout`. Every HTTP and SOCKS record includes `direction=forward` (local → SSH target via `-D`) or `direction=reverse` (SSH target → local via `-R`).
 
+### Checking a configuration
+
+Use the `validate` subcommand to load, merge, and validate CLI flags, environment variables, and `--config` without starting `ssh` or binding any listener:
+
+```sh
+rusty-conduit-ssh validate myhost --config proxy.toml
+rusty-conduit-ssh --http-port 8080 validate myhost --config proxy.toml
+```
+
+Other flags go before the subcommand; only `--config` may follow it.
+
+- On success, it prints `config OK: <path|none> target=<target>` (followed by any startup `NOTICE:` lines) to `stdout` and exits `0`.
+- On failure, it prints `config invalid: <error>` to `stderr` and exits `1`.
+- It checks settings, not the files they name. An unreadable CA key, identity file, or log path still passes `validate` and fails at startup.
+- If you have an SSH host alias literally named `validate`, pass it with `--target validate` so it is not parsed as the subcommand.
+
+**Exit codes:** `0` for a clean exit, `1` for a fatal startup or runtime error, and `2` for a command-line usage error.
+
 ---
 
-## 3. Example `config.toml`
+## 2. Example `config.toml`
 
 Run it with `rusty-conduit-ssh --config config.toml`.
 
@@ -167,7 +186,7 @@ format = "text"
 
 ---
 
-## 4. SSH authentication and `~/.ssh/config`
+## 3. SSH launch and authentication
 
 `rusty-conduit-ssh` launches your system `ssh` with this shape:
 
@@ -211,7 +230,7 @@ rusty-conduit-ssh my-bastion
 
 ---
 
-## 5. Reconnect and keepalive tuning
+## 4. Reconnect and keepalive tuning
 
 **Detecting a dead link.** `ssh` exits after about `interval × count` of silence, which is 45 seconds by default. For faster detection on a reliable network:
 
@@ -256,23 +275,9 @@ To keep that state alive, OS-level TCP keepalive is enabled on each hop that rus
 
 **Shutdown.** `Ctrl+C` or `SIGTERM` stops new connections and drains active ones for up to 5 seconds. `ssh` then receives `SIGTERM` and is killed if it has not exited within 3 seconds. If the reverse proxy is enabled, it drains for up to 5 more seconds after `ssh` stops.
 
-## Checking a configuration
-
-Use the `validate` subcommand to load, merge, and validate CLI flags, environment variables, and `--config` without starting `ssh` or binding any listener:
-
-```sh
-rusty-conduit-ssh validate myhost --config proxy.toml
-```
-
-- On success, it prints `config OK: <path|none> target=<target>` (followed by any startup `NOTICE:` lines) to `stdout` and exits `0`.
-- On failure, it prints `config invalid: <error>` to `stderr` and exits `1`.
-- If you have an SSH host alias literally named `validate`, pass it with `--target validate` so it is not parsed as the subcommand.
-
-**Exit codes:** `0` for a clean exit, `1` for a fatal startup or runtime error, and `2` for a command-line usage error.
-
 ---
 
-## 6. DNS behavior
+## 5. DNS behavior
 
 - HTTP, HTTPS, SOCKS4a, and SOCKS5-with-domain requests pass the **hostname** through the tunnel, and it is resolved on the SSH target.
 - Plain SOCKS4 carries only an IP address, so the client has already resolved the name. Use SOCKS4a or SOCKS5 with remote DNS instead:
@@ -283,11 +288,13 @@ rusty-conduit-ssh validate myhost --config proxy.toml
 
 ---
 
-## 7. Optional HTTPS MITM
+## 6. Optional HTTPS MITM
 
 MITM is **off** until you supply a CA, and a CA is never generated for you. Only inspect traffic you are authorized to inspect, and keep the CA private key protected, because anyone holding it can impersonate sites to clients that trust it.
 
 ### Create a CA
+
+The [MITM CA Guide](MITM-CA-GUIDE.md) walks through creating a PEM or PKCS#12 CA with `openssl`, encrypting its key, and trusting it on Linux, macOS, Windows, Firefox, and CLI tools. The short version, for a quick test:
 
 ```sh
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
@@ -332,7 +339,7 @@ The CA is checked at startup, before SSH authentication. An unparsable or expire
 
 ---
 
-## 8. Reverse proxy (`ssh -R`)
+## 7. Reverse proxy (`ssh -R`)
 
 The reverse proxy is **off** until you set a reverse port. It lets clients on the SSH target egress through the machine running `rusty-conduit-ssh`, over the same supervised SSH connection as the forward proxy.
 
@@ -394,6 +401,49 @@ The reverse proxy has **no authentication**, and it connects from your machine. 
 
 ---
 
+## 8. Logging
+
+### Stream separation and levels
+
+Diagnostic logs, and `ssh`'s own messages, write to **`stderr`**. Access and SOCKS logs write to their configured files, and at `DEBUG` / `VERBOSE` are **also** copied to **`stdout`** so you can pipe them independently.
+
+| Level | `stderr` (Diagnostics) | Access & SOCKS Logs |
+| :--- | :--- | :--- |
+| `QUIET` | None | Files only (if configured) |
+| `FATAL` | Unrecoverable startup errors | Files only |
+| `ERROR` | `FATAL` + runtime / connection errors, tunnel drops | Files only |
+| `INFO` *(default)* | `ERROR` + startup banner, config summary, notices, tunnel ready, shutdown | Files only |
+| `DEBUG` | `INFO` + per-connection lifecycle, rejected handshakes, cap drops | **Files AND `stdout`** |
+| `VERBOSE` | `DEBUG` + cert reaper & cache eviction stats | **Files AND `stdout`** |
+
+Log files are written through a buffer that is flushed whenever no more records are queued, so records reach the file within moments even on a quiet proxy, while bursts are still written in large blocks. Records on `stdout` are written immediately.
+
+### Log formats (`text` vs. `json`)
+
+Every record carries `direction=forward` (local clients → SSH target via `-D`) or `direction=reverse` (clients on the SSH target → your machine via `-R`), right after `kind`.
+
+**`text` (default, logfmt):**
+
+```text
+ts=2026-11-26T20:55:27.608Z kind=http direction=forward client=172.18.0.1:59956 proto=https mitm=false method=CONNECT target=example.com:443 status=200 bytes_in=585 bytes_out=4878 duration_ms=410
+ts=2026-11-26T20:55:27.972Z kind=socks direction=forward client=172.18.0.1:62730 proto=socks5 cmd=CONNECT target=example.com:80 status=ok bytes_in=74 bytes_out=933 duration_ms=234
+```
+
+**`json` (`--log-format json`, NDJSON):**
+
+```json
+{"ts":"2026-11-26T20:55:32.568Z","kind":"http","direction":"forward","client":"172.18.0.1:59966","proto":"https","mitm":false,"method":"CONNECT","target":"example.com:443","status":200,"bytes_in":585,"bytes_out":4877,"duration_ms":328}
+```
+
+Example live filtering with `jq`, showing only reverse-proxy traffic:
+
+```sh
+rusty-conduit-ssh my-bastion --reverse-http-port 8888 --log-level DEBUG --log-format json 2>/dev/null \
+  | jq -r 'select(.direction=="reverse") | "\(.ts) \(.client) \(.target) \(.status)"'
+```
+
+---
+
 ## 9. Security checklist
 
 - Keep `--bind` on loopback unless a firewall restricts access. v1 has **no proxy authentication**, and a non-loopback bind logs a security notice at startup.
@@ -402,35 +452,3 @@ The reverse proxy has **no authentication**, and it connects from your machine. 
 - Keep `--ssh-socks-bind` on loopback. The `ssh -D` listener is also unauthenticated and reaches everything the SSH target can reach.
 - Prefer `RUSTY_CONDUIT_SSH_MITM_CA_PASSPHRASE` or `--mitm-ca-passphrase-file` over `--mitm-ca-passphrase`, which is visible in process listings and shell history.
 - Keep `--max-connections` and `--reverse-max-connections` bounded on shared hosts.
-
-### Open-file limit
-
-Every concurrent proxied connection uses 2 file descriptors (client + upstream), so the proxy needs at least `2 × connections + 64` descriptors, where `connections` is the sum of the active forward (`--max-connections`) and reverse (`--reverse-max-connections`) caps (`8256` for the default forward-only cap of `4096`; unchecked if an active cap is `0`). On Unix, `rusty-conduit-ssh` automatically raises its soft open-file limit (`RLIMIT_NOFILE`) toward the hard limit at startup whenever the current soft limit is below that threshold. If the limit still cannot hold the configured cap, it logs:
-
-```text
-NOTICE: open-file limit is <limit> but <flag> <N> needs at least <needed>; only about <M> concurrent connections will fit. Raise `ulimit -n` (LimitNOFILE= under systemd) or lower <flag>
-```
-
-### Listen backlog (`somaxconn`)
-
-Each listener (forward and reverse proxy, HTTP and SOCKS) asks the kernel for a listen backlog of `4096`: the queue of connections that have finished the TCP handshake but that `rusty-conduit-ssh` has not accepted yet. The kernel caps the request at its own limit:
-
-| OS | Limit | Default |
-| :--- | :--- | :--- |
-| Linux | `net.core.somaxconn` | `4096` (kernel 5.4 and later; `128` before) |
-| macOS | `kern.ipc.somaxconn` | `128` |
-| Windows | set by the OS | — |
-
-The queue only matters during connection bursts, such as many clients reconnecting at once after a network drop. When it is full, the kernel drops the new connection attempts and clients retry about a second later, which shows up as slow connects rather than errors. If you expect bursts larger than the limit, check it and raise it to `4096`:
-
-```sh
-# Linux (persist the setting in /etc/sysctl.d/)
-sysctl net.core.somaxconn
-sudo sysctl -w net.core.somaxconn=4096
-
-# macOS (resets at reboot)
-sysctl kern.ipc.somaxconn
-sudo sysctl -w kern.ipc.somaxconn=4096
-```
-
-A value above `4096` has no effect, because `rusty-conduit-ssh` requests `4096`. The backlog is fixed when a listener opens, so restart `rusty-conduit-ssh` after changing the limit. On Linux, a container has its own `net.core.somaxconn` (normally `4096`) unless it uses the host network; set it with `docker run --sysctl net.core.somaxconn=4096`.
