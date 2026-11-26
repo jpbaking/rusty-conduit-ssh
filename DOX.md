@@ -243,8 +243,10 @@ When the user requests a durable behavior change, record it here or in the relev
 
 ## Feature Map
 
-- **CLI entry and app lifecycle** — parses CLI/env, loads config, starts the tunnel, forward and reverse servers, handles signals, and shuts down in order. Start: `src/main.rs`. Files: `src/lib.rs` (`main_entry`, `run`, `run_until`, `serve`, `shutdown_signal`).
+- **CLI entry and app lifecycle** — parses CLI/env, dispatches `validate`, loads config, starts the tunnel, forward and reverse servers, handles signals, and shuts down in order. Start: `src/main.rs`. Files: `src/lib.rs` (`main_entry`, `run`, `run_until`, `serve`, `shutdown_signal`).
+- **`validate` subcommand** — loads and validates the configuration without starting ssh and exits 0/1. Start: `src/lib.rs` (`cmd_validate`). Files: `src/config.rs` (`Command`), `tests/validate_cmd.rs`.
 - **Configuration** — merges CLI > env > TOML > defaults, validates, and derives engine settings (filters, MITM options, keepalive, startup summary). Start: `src/config.rs`. Files: `docs/USER-GUIDE.md` (user reference).
+- **Open-file limit** — raises the soft `RLIMIT_NOFILE` at startup and logs a NOTICE when it cannot hold the forward plus reverse caps. Start: `src/fdlimit.rs`. Files: `src/lib.rs` (`fd_budget`, `run_until`), `Cargo.toml` (`rlimit`).
 - **SSH tunnel supervisor** — runs `ssh -N -T -4 -D`, probes SOCKS readiness, publishes tunnel state, reconnects with exponential backoff or stops the app under `--no-reconnect`, adds `-R` forwards. Start: `src/ssh.rs`. Files: `src/net.rs` (`TunnelState`).
 - **Tunnel dialer (remote DNS)** — speaks SOCKS5 to the local `ssh -D` listener, sending hostnames unresolved; registered as the `external` `TUNNEL_PROFILE` that all forward traffic routes to. Start: `src/net.rs`. Files: `src/lib.rs` (`forward_routing`, `TUNNEL_PROFILE`).
 - **Forward proxy front end** — HTTP, HTTPS `CONNECT`, SOCKS4/4a/5, and single-port mux, provided by `rusty-conduit-engine` and wired here. Start: `src/lib.rs` (`build_engines`, `serve`). Files: `Cargo.toml` (engine pin).
@@ -256,6 +258,7 @@ When the user requests a durable behavior change, record it here or in the relev
 - **TCP keepalive** — idle/interval/retries applied to forward and reverse client and upstream sockets. Start: `src/config.rs` (`tcp_keepalive_settings`). Files: `src/lib.rs`, `src/reverse.rs`.
 - **Packaging and release** — CI lint/test/docker build; tagged releases build six platform archives, SHA256SUMS, and a multi-arch GHCR image. Start: `.github/workflows/release.yml`. Files: `.github/workflows/ci.yml`, `Dockerfile`, `.dockerignore`.
 - **Test harnesses** — unit-test helpers and the integration mock `ssh`/`ssh -D` harness. Start: `tests/common/mod.rs`. Files: `src/test_support.rs`, `tests/`.
+- **CLI family contract** — test that shared flags keep the family's names, value names, env vars, help text, and defaults. Start: `tests/cli_contract.rs`.
 
 ## Child DOX Index
 

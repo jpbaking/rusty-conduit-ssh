@@ -8,6 +8,7 @@
 //! proxy ([`reverse`]: a second engine server with direct egress, exposed via `ssh -R`).
 
 pub mod config;
+pub mod fdlimit;
 pub mod net;
 pub mod reverse;
 pub mod ssh;
@@ -20,12 +21,13 @@ pub use rusty_conduit_engine::{
 pub use server::EngineHandlers;
 
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
-use config::{CliInput, Config};
+use config::{CliInput, Command, Config};
 use http::HttpProxy;
 use logging::{AccessLogConfig, AccessLogger, LogLevel, Logger, ProxyDirection};
 use mitm::MitmState;
@@ -111,6 +113,23 @@ pub fn log_startup(cfg: &Config, logger: &Logger) {
     }
 }
 
+/// Connections the open-file limit must hold, and the flag(s) to name in the NOTICE.
+fn fd_budget(cfg: &Config) -> (usize, &'static str) {
+    match (cfg.forward_enabled(), cfg.reverse_enabled()) {
+        (true, true) => {
+            let cap = if cfg.max_connections == 0 || cfg.reverse_max_connections == 0 {
+                0
+            } else {
+                cfg.max_connections
+                    .saturating_add(cfg.reverse_max_connections)
+            };
+            (cap, "--max-connections + --reverse-max-connections")
+        }
+        (false, true) => (cfg.reverse_max_connections, "--reverse-max-connections"),
+        _ => (cfg.max_connections, "--max-connections"),
+    }
+}
+
 /// Run with an already-validated configuration until a process signal arrives or the tunnel
 /// drops under `--no-reconnect`. Returns the process exit code. Must be called inside a Tokio
 /// runtime.
@@ -133,6 +152,8 @@ pub async fn run(cfg: Config, logger: Logger) -> ExitCode {
 /// `-R` forwarding), drain the reverse server, then flush the access logs.
 pub async fn run_until(cfg: Config, logger: Logger, interrupted: CancellationToken) -> ExitCode {
     log_startup(&cfg, &logger);
+    let (fd_connections, fd_flag) = fd_budget(&cfg);
+    fdlimit::apply(&logger, fd_connections, fd_flag);
 
     let mut tunnel_cfg = match SshTunnelConfig::from_config(&cfg) {
         Ok(c) => c,
@@ -364,10 +385,43 @@ pub async fn shutdown_signal(logger: &Logger) {
     }
 }
 
+/// `validate [TARGET]`: exit 0 when the configuration is valid, 1 otherwise.
+pub fn cmd_validate(mut cli: CliInput, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
+    if let Some(Command::Validate { target: Some(t) }) = cli.args.command.take() {
+        cli.args.target = Some(t);
+    }
+    match load_config(cli) {
+        Ok(cfg) => {
+            let path = cfg
+                .config_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "none".to_string());
+            let target = cfg.ssh_target.as_deref().unwrap_or("none");
+            let _ = writeln!(out, "config OK: {path} target={target}");
+            for notice in cfg.notices() {
+                let _ = writeln!(out, "{notice}");
+            }
+            0
+        }
+        Err((e, _)) => {
+            let _ = writeln!(err, "config invalid: {e}");
+            EXIT_FATAL
+        }
+    }
+}
+
 /// Full CLI entrypoint: parse args/env (help/version/usage errors exit inside `clap`),
 /// load and validate config, then run on a multi-threaded Tokio runtime.
 pub fn main_entry() -> ExitCode {
     let cli = CliInput::parse();
+    if matches!(cli.args.command, Some(Command::Validate { .. })) {
+        return ExitCode::from(cmd_validate(
+            cli,
+            &mut std::io::stdout(),
+            &mut std::io::stderr(),
+        ));
+    }
     let cfg = match load_config(cli) {
         Ok(cfg) => cfg,
         Err((e, level)) => {
@@ -704,5 +758,52 @@ mod tests {
     #[tokio::test]
     async fn http_proxy_active_on_multiplexed_listener() {
         check_plan(ListenPlan::Multiplexed("127.0.0.1:0".parse().unwrap())).await;
+    }
+
+    #[test]
+    fn fd_budget_forward_only_defaults() {
+        let cfg = Config::default();
+        assert_eq!(fd_budget(&cfg), (4096, "--max-connections"));
+    }
+
+    #[test]
+    fn fd_budget_forward_and_reverse_sums_caps() {
+        let cfg = Config {
+            reverse_http_port: 9,
+            reverse_max_connections: 10,
+            ..Config::default()
+        };
+        assert_eq!(
+            fd_budget(&cfg),
+            (4106, "--max-connections + --reverse-max-connections")
+        );
+    }
+
+    #[test]
+    fn fd_budget_forward_and_reverse_zero_disables() {
+        let cfg = Config {
+            max_connections: 0,
+            reverse_http_port: 9,
+            reverse_max_connections: 10,
+            ..Config::default()
+        };
+        assert_eq!(
+            fd_budget(&cfg),
+            (0, "--max-connections + --reverse-max-connections")
+        );
+    }
+
+    #[test]
+    fn fd_budget_reverse_only() {
+        let cfg = Config {
+            http_port: 0,
+            socks_port: 0,
+            reverse_socks_port: 9,
+            ..Config::default()
+        };
+        assert_eq!(
+            fd_budget(&cfg),
+            (cfg.reverse_max_connections, "--reverse-max-connections")
+        );
     }
 }

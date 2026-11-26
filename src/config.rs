@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use clap::error::ErrorKind;
 use clap::parser::ValueSource;
-use clap::{ArgAction, ArgMatches, CommandFactory, FromArgMatches, Parser};
+use clap::{ArgAction, ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand};
 use serde::de::{self, Deserializer, Visitor};
 use serde::Deserialize;
 
@@ -32,7 +32,7 @@ use crate::server::ServerOptions;
 pub const DEFAULT_BIND: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 /// Default HTTP/HTTPS proxy port.
 pub const DEFAULT_HTTP_PORT: u16 = 3128;
-/// Default SOCKS4/5 proxy port.
+/// Default SOCKS4/4a/5 proxy port.
 pub const DEFAULT_SOCKS_PORT: u16 = 1080;
 /// Default remote bind address of the reverse proxy (`ssh -R`).
 pub const DEFAULT_REVERSE_BIND: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -47,7 +47,7 @@ pub const MAX_TCP_KEEPALIVE_DURATION: Duration = Duration::from_secs(32_767);
 /// Largest accepted TCP keepalive probe count (Linux caps `TCP_KEEPCNT` at 127).
 pub const MAX_TCP_KEEPALIVE_RETRIES: u32 = 127;
 /// Default cap on cached MITM leaf certificates (`0` = unlimited).
-pub const DEFAULT_MITM_CERT_CACHE_MAX_ENTRIES: usize = 10_000;
+pub const DEFAULT_MITM_CERT_CACHE_MAX_ENTRIES: usize = 10_240;
 /// Default `ssh` executable.
 pub const DEFAULT_SSH_BIN: &str = "ssh";
 /// Default bind address of the local `ssh -D` SOCKS listener.
@@ -187,16 +187,30 @@ pub enum ConfigError {
     InvalidKeepalive(String),
 }
 
+/// Subcommands. Without one, the proxy runs.
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum Command {
+    /// Validate the configuration (flags, environment, and --config file) and exit 0/1
+    Validate {
+        /// SSH destination to validate with (same as the positional TARGET)
+        #[arg(value_name = "TARGET")]
+        target: Option<String>,
+    },
+}
+
 /// Raw command-line / environment input (`clap` derive with `env` fallbacks).
 #[derive(Debug, Clone, Default, Parser)]
 #[command(
     name = "rusty-conduit-ssh",
     version,
-    about = "Lightweight HTTP/HTTPS and SOCKS4/4a/5 proxy server with optional HTTPS MITM inspection",
-    long_about = "Lightweight HTTP/HTTPS and SOCKS4/4a/5 proxy server with optional HTTPS MITM inspection.\n\n\
+    about = "Lightweight HTTP/HTTPS and SOCKS4/4a/5 proxy that sends all upstream traffic and DNS through an auto-reconnecting ssh -D tunnel, with optional HTTPS MITM inspection",
+    long_about = "Lightweight HTTP/HTTPS and SOCKS4/4a/5 proxy that sends all upstream traffic and DNS through an auto-reconnecting ssh -D tunnel, with optional HTTPS MITM inspection.\n\n\
                   Precedence: CLI flags > RUSTY_CONDUIT_SSH_* environment variables > --config TOML file > defaults."
 )]
 pub struct CliArgs {
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
     /// SSH destination, as accepted by `ssh` (host, user@host, or a ~/.ssh/config alias)
     #[arg(value_name = "TARGET")]
     pub target: Option<String>,
@@ -210,7 +224,12 @@ pub struct CliArgs {
     pub target_option: Option<String>,
 
     /// Optional TOML configuration file path
-    #[arg(long, value_name = "PATH", env = "RUSTY_CONDUIT_SSH_CONFIG")]
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH",
+        env = "RUSTY_CONDUIT_SSH_CONFIG"
+    )]
     pub config: Option<PathBuf>,
 
     /// IPv4 or IPv6 address to bind listeners to [default: 127.0.0.1]
@@ -221,7 +240,7 @@ pub struct CliArgs {
     #[arg(long, value_name = "PORT", env = "RUSTY_CONDUIT_SSH_HTTP_PORT")]
     pub http_port: Option<u16>,
 
-    /// SOCKS4/5 proxy port, 0 to disable [default: 1080]
+    /// SOCKS4/4a/5 proxy port, 0 to disable [default: 1080]
     #[arg(long, value_name = "PORT", env = "RUSTY_CONDUIT_SSH_SOCKS_PORT")]
     pub socks_port: Option<u16>,
 
@@ -255,7 +274,8 @@ pub struct CliArgs {
     )]
     pub tcp_keepalive_retries: Option<u32>,
 
-    /// Allowlist of destinations for the forward proxy (IP, CIDR, FQDN, or *.domain); repeatable or comma-separated
+    /// Allowlist of destinations for the forward proxy (IP, CIDR, FQDN, or *.domain); repeatable or comma-separated.
+    /// When combined with --block, serves as exceptions to the blocklist.
     #[arg(
         long,
         value_name = "RULE",
@@ -264,7 +284,8 @@ pub struct CliArgs {
     )]
     pub allow: Vec<FilterRule>,
 
-    /// Blocklist of destinations for the forward proxy (IP, CIDR, FQDN, or *.domain); repeatable or comma-separated
+    /// Blocklist of destinations for the forward proxy (IP, CIDR, FQDN, or *.domain); repeatable or comma-separated.
+    /// Combine with --allow to carve out exceptions.
     #[arg(
         long,
         value_name = "RULE",
@@ -297,7 +318,8 @@ pub struct CliArgs {
     )]
     pub reverse_max_connections: Option<usize>,
 
-    /// Allowlist of destinations for the reverse proxy (IP, CIDR, FQDN, or *.domain); repeatable or comma-separated
+    /// Allowlist of destinations for the reverse proxy (IP, CIDR, FQDN, or *.domain); repeatable or comma-separated.
+    /// When combined with --reverse-block, serves as exceptions to the reverse blocklist.
     #[arg(
         long,
         value_name = "RULE",
@@ -306,7 +328,8 @@ pub struct CliArgs {
     )]
     pub reverse_allow: Vec<FilterRule>,
 
-    /// Blocklist of destinations for the reverse proxy (IP, CIDR, FQDN, or *.domain); repeatable or comma-separated
+    /// Blocklist of destinations for the reverse proxy (IP, CIDR, FQDN, or *.domain); repeatable or comma-separated.
+    /// Combine with --reverse-allow to carve out exceptions.
     #[arg(
         long,
         value_name = "RULE",
@@ -353,7 +376,7 @@ pub struct CliArgs {
     )]
     pub mitm_cert_ttl: Option<Duration>,
 
-    /// Maximum cached MITM leaf certificates; expired then oldest entries are evicted, 0 = unlimited [default: 10000]
+    /// Maximum cached MITM leaf certificates; expired then oldest entries are evicted, 0 = unlimited [default: 10240]
     #[arg(
         long,
         value_name = "N",
@@ -361,7 +384,7 @@ pub struct CliArgs {
     )]
     pub mitm_cert_cache_max_entries: Option<usize>,
 
-    /// Reject HTTP/HTTPS traffic over SOCKS4/5 (works with or without MITM)
+    /// Reject HTTP/HTTPS traffic over SOCKS4/4a/5 (works with or without MITM)
     #[arg(
         long,
         env = "RUSTY_CONDUIT_SSH_SOCKS_BLOCK_WEB",
@@ -392,7 +415,7 @@ pub struct CliArgs {
     #[arg(long, value_name = "PATH", env = "RUSTY_CONDUIT_SSH_HTTP_ACCESS_LOG")]
     pub http_access_log: Option<PathBuf>,
 
-    /// Optional file path for SOCKS4/5 connection logs
+    /// Optional file path for SOCKS4/4a/5 connection logs
     #[arg(long, value_name = "PATH", env = "RUSTY_CONDUIT_SSH_SOCKS_LOG")]
     pub socks_log: Option<PathBuf>,
 
@@ -587,7 +610,7 @@ pub struct FileConfig {
     pub tcp_keepalive_retries: Option<u32>,
     pub allow: Option<Vec<String>>,
     pub block: Option<Vec<String>>,
-    /// Reject HTTP/HTTPS traffic over SOCKS4/5 (works with or without MITM).
+    /// Reject HTTP/HTTPS traffic over SOCKS4/4a/5 (works with or without MITM).
     pub socks_block_web: Option<bool>,
     #[serde(default)]
     pub mitm: FileMitmConfig,
@@ -730,9 +753,9 @@ pub struct Config {
     pub tcp_keepalive_interval: Duration,
     /// Unanswered TCP keepalive probes before the OS closes the connection.
     pub tcp_keepalive_retries: u32,
-    /// Forward proxy destination allowlist (mutually exclusive with `block`).
+    /// Forward proxy destination allowlist (exceptions to `block` when both are set).
     pub allow: Vec<FilterRule>,
-    /// Forward proxy destination blocklist (mutually exclusive with `allow`).
+    /// Forward proxy destination blocklist (combine with `allow` to carve out exceptions).
     pub block: Vec<FilterRule>,
     /// Remote bind address for `ssh -R` on the SSH target.
     pub reverse_bind: IpAddr,
@@ -743,9 +766,9 @@ pub struct Config {
     /// Maximum concurrent reverse proxy client connections (`0` = unlimited). When no layer
     /// sets it, it takes the resolved `max_connections`.
     pub reverse_max_connections: usize,
-    /// Reverse proxy destination allowlist (mutually exclusive with `reverse_block`).
+    /// Reverse proxy destination allowlist (exceptions to `reverse_block` when both are set).
     pub reverse_allow: Vec<FilterRule>,
-    /// Reverse proxy destination blocklist (mutually exclusive with `reverse_allow`).
+    /// Reverse proxy destination blocklist (combine with `reverse_allow` to carve out exceptions).
     pub reverse_block: Vec<FilterRule>,
     pub mitm_ca_cert: Option<PathBuf>,
     pub mitm_ca_key: Option<PathBuf>,
@@ -1946,10 +1969,10 @@ socks_log = "/file/socks.log"
         let _env = EnvGuard::new(&[]);
         let cfg = load(&[]).unwrap();
         assert_eq!(cfg.max_connections, 4096);
-        assert_eq!(cfg.mitm_cert_cache_max_entries, 10_000);
+        assert_eq!(cfg.mitm_cert_cache_max_entries, 10_240);
         let s = cfg.summary();
         assert!(s.contains("max_connections=4096"), "{s}");
-        assert!(s.contains("mitm_cert_cache_max_entries=10000"), "{s}");
+        assert!(s.contains("mitm_cert_cache_max_entries=10240"), "{s}");
     }
 
     #[test]

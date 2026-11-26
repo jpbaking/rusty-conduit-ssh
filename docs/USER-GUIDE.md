@@ -31,7 +31,7 @@ Environment variable names below omit the `RUSTY_CONDUIT_SSH_` prefix. For examp
 | `--config <PATH>` | `CONFIG` | n/a | none | TOML configuration file |
 | `--bind <IP>` | `BIND` | `bind` | `127.0.0.1` | IPv4 or IPv6 listener address |
 | `--http-port <PORT>` | `HTTP_PORT` | `http_port` | `3128` | HTTP/HTTPS port, `0` disables |
-| `--socks-port <PORT>` | `SOCKS_PORT` | `socks_port` | `1080` | SOCKS4/5 port, `0` disables |
+| `--socks-port <PORT>` | `SOCKS_PORT` | `socks_port` | `1080` | SOCKS4/4a/5 port, `0` disables |
 | `--max-connections <N>` | `MAX_CONNECTIONS` | `max_connections` | `4096` | Concurrent forward proxy clients, HTTP and SOCKS combined, `0` = unlimited. Excess connections are closed immediately. Also the reverse cap unless `--reverse-max-connections` is set |
 | `--tcp-keepalive <DURATION>` | `TCP_KEEPALIVE` | `tcp_keepalive` | `60s` | Idle time before TCP keepalive probes start, on forward and reverse client sockets and reverse upstream sockets. `0` disables; otherwise `1s` to `32767s` |
 | `--tcp-keepalive-interval <DURATION>` | `TCP_KEEPALIVE_INTERVAL` | `tcp_keepalive_interval` | `10s` | Time between unanswered keepalive probes, `1s` to `32767s` |
@@ -47,15 +47,15 @@ At least one forward or reverse listener must be enabled. Setting both ports to 
 | `--reverse-http-port <PORT>` | `REVERSE_HTTP_PORT` | `reverse.http_port` | `0` | HTTP/HTTPS port on the SSH target, `0` disables |
 | `--reverse-socks-port <PORT>` | `REVERSE_SOCKS_PORT` | `reverse.socks_port` | `0` | SOCKS4/4a/5 port on the SSH target, `0` disables |
 | `--reverse-max-connections <N>` | `REVERSE_MAX_CONNECTIONS` | `reverse.max_connections` | same as `--max-connections` | Concurrent reverse proxy clients, HTTP and SOCKS combined, `0` = unlimited. Excess connections are closed immediately |
-| `--reverse-allow <RULE>` | `REVERSE_ALLOW` | `reverse.allow` | none | Reverse allowlist (IP, CIDR, FQDN, or `*.domain`); mutually exclusive with `--reverse-block` |
-| `--reverse-block <RULE>` | `REVERSE_BLOCK` | `reverse.block` | none | Reverse blocklist (IP, CIDR, FQDN, or `*.domain`); mutually exclusive with `--reverse-allow` |
+| `--reverse-allow <RULE>` | `REVERSE_ALLOW` | `reverse.allow` | none | Reverse allowlist (IP, CIDR, FQDN, or `*.domain`); when combined with `--reverse-block`, serves as exceptions to the reverse blocklist |
+| `--reverse-block <RULE>` | `REVERSE_BLOCK` | `reverse.block` | none | Reverse blocklist (IP, CIDR, FQDN, or `*.domain`); combine with `--reverse-allow` to block the blocklist except the allowlist entries |
 
 ### Destination filtering (forward proxy)
 
 | CLI flag | Env (after prefix) | TOML key | Default | Description |
 | :--- | :--- | :--- | :--- | :--- |
-| `--allow <RULE>` | `ALLOW` | `allow` | none | Forward allowlist (IP, CIDR, FQDN, or `*.domain`); mutually exclusive with `--block` |
-| `--block <RULE>` | `BLOCK` | `block` | none | Forward blocklist (IP, CIDR, FQDN, or `*.domain`); mutually exclusive with `--allow` |
+| `--allow <RULE>` | `ALLOW` | `allow` | none | Forward allowlist (IP, CIDR, FQDN, or `*.domain`); when combined with `--block`, serves as exceptions to the blocklist |
+| `--block <RULE>` | `BLOCK` | `block` | none | Forward blocklist (IP, CIDR, FQDN, or `*.domain`); combine with `--allow` to block the blocklist except the allowlist entries |
 
 CLI flags may be repeated or comma-separated (e.g. `--reverse-block 127.0.0.0/8,::1,*.internal`). Wildcards use a leading `*.` prefix and match subdomains only (`*.example.com` matches `api.example.com`, not bare `example.com`). Blocked requests return HTTP `403 Forbidden`, SOCKS5 `0x02` (`not_allowed`), or SOCKS4 `0x5B`. On the **reverse** path, hostnames are resolved locally before connecting so IP/CIDR rules also catch hostnames that resolve to blocked IPs (e.g. `localhost` → `127.0.0.1`). On the **forward** path, DNS remains remote-only, so FQDN rules match domain requests and IP/CIDR rules match literal IP requests.
 
@@ -91,8 +91,8 @@ See [Reverse proxy](#8-reverse-proxy-ssh--r) for behavior and security guidance.
 | `--mitm-ca-passphrase <STR>` | `MITM_CA_PASSPHRASE` | `mitm.ca_passphrase` | none | CA passphrase. Prefer the env var or a file |
 | `--mitm-ca-passphrase-file <PATH>` | `MITM_CA_PASSPHRASE_FILE` | `mitm.ca_passphrase_file` | none | File holding the passphrase, trailing newline trimmed |
 | `--mitm-cert-ttl <DURATION>` | `MITM_CERT_TTL` | `mitm.cert_ttl` | `1h` | Leaf certificate TTL, minimum `10s` |
-| `--mitm-cert-cache-max-entries <N>` | `MITM_CERT_CACHE_MAX_ENTRIES` | `mitm.cert_cache_max_entries` | `10000` | Leaf cache cap, `0` = unlimited |
-| `--socks-block-web-in-mitm` | `SOCKS_BLOCK_WEB_IN_MITM` | `mitm.socks_block_web` | `false` | With MITM on, reject HTTP/HTTPS over SOCKS |
+| `--mitm-cert-cache-max-entries <N>` | `MITM_CERT_CACHE_MAX_ENTRIES` | `mitm.cert_cache_max_entries` | `10240` | Leaf cache cap, `0` = unlimited |
+| `--socks-block-web` | `SOCKS_BLOCK_WEB` | `socks_block_web` | `false` | Reject HTTP/HTTPS traffic over SOCKS4/4a/5 (works with or without MITM). The old names `--socks-block-web-in-mitm` and `mitm.socks_block_web` still work |
 
 ### Logging
 
@@ -116,6 +116,7 @@ bind = "127.0.0.1"
 http_port = 3128
 socks_port = 1080
 max_connections = 4096
+socks_block_web = false
 tcp_keepalive = "60s"          # "0" disables
 tcp_keepalive_interval = "10s"
 tcp_keepalive_retries = 5
@@ -155,8 +156,7 @@ socks_port = 0
 # ca_passphrase = "change-me"
 # ca_passphrase_file = "/etc/rusty-conduit-ssh/ca.pass"
 cert_ttl = "1h"
-cert_cache_max_entries = 10000
-socks_block_web = false
+cert_cache_max_entries = 10240
 
 [logging]
 level = "INFO"
@@ -256,6 +256,18 @@ To keep that state alive, OS-level TCP keepalive is enabled on each hop that rus
 
 **Shutdown.** `Ctrl+C` or `SIGTERM` stops new connections and drains active ones for up to 5 seconds. `ssh` then receives `SIGTERM` and is killed if it has not exited within 3 seconds. If the reverse proxy is enabled, it drains for up to 5 more seconds after `ssh` stops.
 
+## Checking a configuration
+
+Use the `validate` subcommand to load, merge, and validate CLI flags, environment variables, and `--config` without starting `ssh` or binding any listener:
+
+```sh
+rusty-conduit-ssh validate myhost --config proxy.toml
+```
+
+- On success, it prints `config OK: <path|none> target=<target>` (followed by any startup `NOTICE:` lines) to `stdout` and exits `0`.
+- On failure, it prints `config invalid: <error>` to `stderr` and exits `1`.
+- If you have an SSH host alias literally named `validate`, pass it with `--target validate` so it is not parsed as the subcommand.
+
 **Exit codes:** `0` for a clean exit, `1` for a fatal startup or runtime error, and `2` for a command-line usage error.
 
 ---
@@ -316,7 +328,7 @@ The CA is checked at startup, before SSH authentication. An unparsable or expire
 - MITM applies to HTTPS requests made through the **HTTP proxy** with `CONNECT`. HTTP/1.1 and HTTP/2 are supported.
 - Upstream certificates are verified against the platform trust store.
 - Leaf certificates are cached in memory only, bounded by `--mitm-cert-ttl` and `--mitm-cert-cache-max-entries`.
-- SOCKS traffic is not intercepted. To stop web traffic bypassing inspection over SOCKS, add `--socks-block-web-in-mitm`. Blocked sessions are closed and logged with `status=blocked_web_in_mitm`, while non-web protocols such as SSH or Postgres pass through.
+- SOCKS traffic is not intercepted. To stop web traffic bypassing inspection over SOCKS, add `--socks-block-web`. Blocked sessions are closed and logged with `status=blocked_web_in_mitm`, while non-web protocols such as SSH or Postgres pass through.
 
 ---
 
@@ -390,3 +402,11 @@ The reverse proxy has **no authentication**, and it connects from your machine. 
 - Keep `--ssh-socks-bind` on loopback. The `ssh -D` listener is also unauthenticated and reaches everything the SSH target can reach.
 - Prefer `RUSTY_CONDUIT_SSH_MITM_CA_PASSPHRASE` or `--mitm-ca-passphrase-file` over `--mitm-ca-passphrase`, which is visible in process listings and shell history.
 - Keep `--max-connections` and `--reverse-max-connections` bounded on shared hosts.
+
+### Open-file limit
+
+Every concurrent proxied connection uses 2 file descriptors (client + upstream), so the proxy needs at least `2 × connections + 64` descriptors, where `connections` is the sum of the active forward (`--max-connections`) and reverse (`--reverse-max-connections`) caps (`8256` for the default forward-only cap of `4096`; unchecked if an active cap is `0`). On Unix, `rusty-conduit-ssh` automatically raises its soft open-file limit (`RLIMIT_NOFILE`) toward the hard limit at startup whenever the current soft limit is below that threshold. If the limit still cannot hold the configured cap, it logs:
+
+```text
+NOTICE: open-file limit is <limit> but <flag> <N> needs at least <needed>; only about <M> concurrent connections will fit. Raise `ulimit -n` (LimitNOFILE= under systemd) or lower <flag>
+```

@@ -79,6 +79,9 @@ rusty-conduit-ssh my-bastion --http-port 0 --socks-port 0 --reverse-http-port 88
 # Reverse proxy with a blocklist so remote clients cannot reach your loopback or LAN
 rusty-conduit-ssh my-bastion --reverse-http-port 8888 --reverse-socks-port 8888 \
   --reverse-block 127.0.0.0/8,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+
+# Check a configuration without starting ssh
+rusty-conduit-ssh validate myhost --config proxy.toml
 ```
 
 On the SSH target, use the reverse proxy like any other:
