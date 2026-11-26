@@ -1255,7 +1255,7 @@ impl Config {
         let mut out = Vec::new();
         if self.is_non_loopback_bind() {
             out.push(format!(
-                "SECURITY NOTICE: binding to non-loopback address {}; rusty-conduit-ssh v1 has NO \
+                "SECURITY NOTICE: binding to non-loopback address {}; rusty-conduit-ssh has NO \
                  authentication, so anyone who can reach this address can use the proxy",
                 self.bind
             ));

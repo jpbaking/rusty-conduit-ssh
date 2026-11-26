@@ -446,7 +446,7 @@ rusty-conduit-ssh my-bastion --reverse-http-port 8888 --log-level DEBUG --log-fo
 
 ## 9. Security checklist
 
-- Keep `--bind` on loopback unless a firewall restricts access. v1 has **no proxy authentication**, and a non-loopback bind logs a security notice at startup.
+- Keep `--bind` on loopback unless a firewall restricts access. There is **no proxy authentication**, and a non-loopback bind logs a security notice at startup.
 - Keep `--reverse-bind` on loopback. The reverse proxy gives its clients access to whatever your machine can reach, including its loopback services.
 - On SSH targets where you run the reverse proxy, set `GatewayPorts clientspecified` in `sshd_config`. With `GatewayPorts yes`, sshd binds remote forwards to all interfaces even when you request `127.0.0.1`.
 - Keep `--ssh-socks-bind` on loopback. The `ssh -D` listener is also unauthenticated and reaches everything the SSH target can reach.

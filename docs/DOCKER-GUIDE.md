@@ -21,7 +21,7 @@ The examples were tested with Docker Engine 29.9 and Docker Compose 5.7 on Docke
 | **Ports** | `3128` (HTTP/HTTPS) and `1080` (SOCKS4/4a/5) |
 | **Environment** | `RUSTY_CONDUIT_SSH_BIND=0.0.0.0`, so the listeners accept connections forwarded by Docker, and `MALLOC_ARENA_MAX=2`, which keeps memory low on hosts with many CPUs |
 
-Pin a major tag such as `:1` so you get fixes and features within that major version, but not breaking changes. To build the image yourself from a clone of the repository:
+Pin a major tag such as `:2` so you get fixes and features within that major version, but not breaking changes. To build the image yourself from a clone of the repository:
 
 ```sh
 docker build -t rusty-conduit-ssh .
@@ -89,12 +89,12 @@ docker run -d --name rusty-conduit-ssh --restart unless-stopped \
   -p 127.0.0.1:3128:3128 \
   -p 127.0.0.1:1080:1080 \
   -v "$PWD/ssh:/ssh:ro" \
-  ghcr.io/jpbaking/rusty-conduit-ssh:1 \
+  ghcr.io/jpbaking/rusty-conduit-ssh:2 \
   my-bastion -F /ssh/config
 ```
 
 - **The listeners open once the tunnel is ready.** Watch for `SSH tunnel ready` in `docker logs rusty-conduit-ssh`. If the server restarts or the link drops, the tunnel reconnects with backoff while the listeners stay open.
-- **Publish on `127.0.0.1`.** Inside the container the proxy listens on `0.0.0.0`, so the `SECURITY NOTICE` at startup is expected. What decides who can reach it is the host side of `-p`: `-p 3128:3128` without an address exposes the proxy to your network, and v1 has **no proxy authentication**.
+- **Publish on `127.0.0.1`.** Inside the container the proxy listens on `0.0.0.0`, so the `SECURITY NOTICE` at startup is expected. What decides who can reach it is the host side of `-p`: `-p 3128:3128` without an address exposes the proxy to your network, and there is **no proxy authentication**.
 - **Flags and environment variables** work as usual: put flags after the image name, or pass `-e RUSTY_CONDUIT_SSH_*` variables. Other `ssh` options can go in `/ssh/config` or after `--`.
 - **On a Linux host**, add `--user "$(id -u):$(id -g)"` so the container can read your files ([section 2](#file-ownership)).
 - **Memory:** the image sets `MALLOC_ARENA_MAX=2`, which keeps memory low on hosts with many CPUs. Leave it in place unless you measure otherwise; see [Performance, Footprint & Sizing](PERFORMANCE-AND-SIZING.md#memory-on-many-core-linux-malloc_arena_max).
@@ -112,14 +112,14 @@ docker run -d --name rusty-conduit-ssh \
   -p 127.0.0.1:3128:3128 -p 127.0.0.1:1080:1080 \
   -v "$PWD/ssh:/ssh:ro" \
   -v "$PWD/conf:/etc/rusty-conduit-ssh:ro" \
-  ghcr.io/jpbaking/rusty-conduit-ssh:1 --config /etc/rusty-conduit-ssh/config.toml
+  ghcr.io/jpbaking/rusty-conduit-ssh:2 --config /etc/rusty-conduit-ssh/config.toml
 ```
 
 Check it before starting; `validate` does not start `ssh`:
 
 ```sh
 docker run --rm -v "$PWD/conf:/etc/rusty-conduit-ssh:ro" \
-  ghcr.io/jpbaking/rusty-conduit-ssh:1 validate --config /etc/rusty-conduit-ssh/config.toml
+  ghcr.io/jpbaking/rusty-conduit-ssh:2 validate --config /etc/rusty-conduit-ssh/config.toml
 # config OK: /etc/rusty-conduit-ssh/config.toml target=my-bastion
 ```
 
@@ -154,7 +154,7 @@ docker run -d --name rusty-conduit-ssh \
   -p 127.0.0.1:3128:3128 -p 127.0.0.1:1080:1080 \
   -v "$PWD/ssh:/ssh:ro" \
   -v rusty-conduit-ssh-logs:/var/log/rusty-conduit-ssh \
-  ghcr.io/jpbaking/rusty-conduit-ssh:1 my-bastion \
+  ghcr.io/jpbaking/rusty-conduit-ssh:2 my-bastion \
   --http-access-log /var/log/rusty-conduit-ssh/access.log \
   --socks-log /var/log/rusty-conduit-ssh/socks.log \
   -F /ssh/config
@@ -176,7 +176,7 @@ docker run -d --name rusty-conduit-ssh \
   -p 127.0.0.1:3128:3128 -p 127.0.0.1:1080:1080 \
   -v "$PWD/ssh:/ssh:ro" \
   -v "$PWD/ca:/etc/rusty-conduit-ssh/ca:ro" \
-  ghcr.io/jpbaking/rusty-conduit-ssh:1 my-bastion \
+  ghcr.io/jpbaking/rusty-conduit-ssh:2 my-bastion \
   --mitm-ca-cert /etc/rusty-conduit-ssh/ca/ca.pem \
   --mitm-ca-key /etc/rusty-conduit-ssh/ca/ca.key \
   -F /ssh/config
@@ -224,7 +224,7 @@ docker compose down
 ```yaml
 services:
   rusty-conduit-ssh:
-    image: ghcr.io/jpbaking/rusty-conduit-ssh:1
+    image: ghcr.io/jpbaking/rusty-conduit-ssh:2
     restart: unless-stopped
     user: "1000:1000"   # Linux: your $(id -u):$(id -g); remove on Docker Desktop
     command: ["my-bastion", "-F", "/ssh/config"]
@@ -271,7 +271,7 @@ block = ["127.0.0.0/8", "::1", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
 ```yaml
 services:
   rusty-conduit-ssh:
-    image: ghcr.io/jpbaking/rusty-conduit-ssh:1
+    image: ghcr.io/jpbaking/rusty-conduit-ssh:2
     restart: unless-stopped
     command: ["--config", "/etc/rusty-conduit-ssh/config.toml"]
     ports:
@@ -292,7 +292,7 @@ Services on the same Compose network reach the proxy by its service name, so the
 ```yaml
 services:
   proxy:
-    image: ghcr.io/jpbaking/rusty-conduit-ssh:1
+    image: ghcr.io/jpbaking/rusty-conduit-ssh:2
     restart: unless-stopped
     command: ["my-bastion", "-F", "/ssh/config"]
     volumes:
@@ -325,5 +325,5 @@ The `app` request fails if it starts before the tunnel is ready; in real service
 | `Error connecting to agent: Permission denied` | The Docker Desktop agent socket is root-owned, mode `660` | Add `--group-add 0` ([section 2](#2-give-the-container-its-ssh-files)) |
 | `SSH tunnel down: ... reconnecting` after startup | The SSH server or the link went away | Nothing; the tunnel reconnects with backoff and the listeners stay open |
 | `FATAL MITM setup failed: failed to read MITM CA file ...: Permission denied` | The CA key is not readable by the container's UID | Run as your own UID, or `sudo chown 10001` the key on the host |
-| Clients on other machines cannot connect | The ports are published on `127.0.0.1` | Publish on a LAN address or `0.0.0.0` only behind a firewall: v1 has no proxy authentication |
+| Clients on other machines cannot connect | The ports are published on `127.0.0.1` | Publish on a LAN address or `0.0.0.0` only behind a firewall: there is no proxy authentication |
 | Memory is much higher than the sizing guide says | `MALLOC_ARENA_MAX` was overridden or unset, so glibc allocates a memory arena per worker thread | Keep the image default, `MALLOC_ARENA_MAX=2` ([section 8](#8-resource-limits-health-checks-and-hardening)) |

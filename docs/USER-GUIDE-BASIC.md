@@ -27,12 +27,12 @@ Extract it and place `rusty-conduit-ssh` (or `rusty-conduit-ssh.exe`) somewhere 
 Multi-arch images (`linux/amd64` and `linux/arm64`, based on Ubuntu 26.04 LTS, with `openssh-client` included) are published to GitHub Container Registry on each release. They run as a non-root user (UID `10001`). The container needs a key, `known_hosts`, and an SSH `config` in a directory mounted at `/ssh`:
 
 ```sh
-# Publish to host loopback only (recommended: v1 has no proxy authentication)
+# Publish to host loopback only (recommended: there is no proxy authentication)
 docker run --rm \
   -p 127.0.0.1:3128:3128 \
   -p 127.0.0.1:1080:1080 \
   -v "$PWD/ssh:/ssh:ro" \
-  ghcr.io/jpbaking/rusty-conduit-ssh:1 \
+  ghcr.io/jpbaking/rusty-conduit-ssh:2 \
   my-bastion -F /ssh/config
 ```
 
@@ -205,7 +205,7 @@ DNS stays on the SSH target, so FQDN rules match the names clients ask for, and 
 rusty-conduit-ssh my-bastion --bind 0.0.0.0
 ```
 
-> **Note:** v1 has **no proxy authentication**. Binding to a non-loopback address prints a security notice at startup. Restrict access with your firewall and keep `--max-connections` bounded (see [Performance, Footprint & Sizing](PERFORMANCE-AND-SIZING.md)).
+> **Note:** There is **no proxy authentication**. Binding to a non-loopback address prints a security notice at startup. Restrict access with your firewall and keep `--max-connections` bounded (see [Performance, Footprint & Sizing](PERFORMANCE-AND-SIZING.md)).
 
 ### Check a configuration before starting
 

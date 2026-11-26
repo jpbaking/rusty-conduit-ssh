@@ -1,6 +1,6 @@
 [package]
 name = "rusty-conduit-ssh"
-version = "1.5.0"
+version = "2.0.0"
 edition = "2021"
 description = "Single-binary HTTP/HTTPS and SOCKS4/4a/5 forward proxy that routes all upstream traffic and DNS through an auto-reconnecting SSH dynamic tunnel"
 license = "BSD-3-Clause"
