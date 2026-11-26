@@ -304,7 +304,7 @@ async fn serve(
 /// Build the forward HTTP and SOCKS engines, all dialing through `dialer` (see
 /// [`forward_routing`]) and logging with `direction=forward`, enabling HTTPS interception
 /// when `mitm` is present and the SOCKS web guard when additionally
-/// `--socks-block-web-in-mitm` is set.
+/// `--socks-block-web` is set.
 pub fn build_engines(
     cfg: &Config,
     mitm: Option<&MitmState>,
@@ -341,7 +341,7 @@ pub(crate) fn build_engines_with(
         ));
         http = http.with_mitm(Arc::new(m.interceptor.clone()));
     }
-    if cfg.socks_block_web_in_mitm {
+    if cfg.socks_block_web {
         logger.info("SOCKS web blocking enabled: HTTP/HTTPS over SOCKS is rejected");
         socks = socks.with_guard(Arc::new(socks::web_guard::WebGuard));
     }
@@ -708,7 +708,7 @@ mod tests {
         let mut cfg = Config {
             mitm_ca_cert: Some(cert),
             mitm_ca_key: Some(key),
-            socks_block_web_in_mitm: true,
+            socks_block_web: true,
             ..Config::default()
         };
         let provider = crate::mitm::crypto_provider();
@@ -739,7 +739,7 @@ mod tests {
             (false, true),
             "MITM off: SOCKS web guard still active when flag is set"
         );
-        cfg.socks_block_web_in_mitm = false;
+        cfg.socks_block_web = false;
         let (h, s) = build_engines(&cfg, Some(&state), &access, &logger, direct_dialer());
         assert_eq!(guarded(&h, &s), (true, false));
     }

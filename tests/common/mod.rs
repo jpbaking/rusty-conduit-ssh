@@ -272,7 +272,7 @@ impl Proxy {
             log_format: opts.log_format,
             http_access_log: Some(http_log.clone()),
             socks_log: Some(socks_log.clone()),
-            socks_block_web_in_mitm: opts.block_web,
+            socks_block_web: opts.block_web,
             ..Config::default()
         };
 

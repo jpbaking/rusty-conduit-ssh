@@ -393,16 +393,6 @@ pub struct CliArgs {
     )]
     pub socks_block_web: bool,
 
-    /// Backwards-compatible alias for --socks-block-web
-    #[arg(
-        long = "socks-block-web-in-mitm",
-        hide = true,
-        env = "RUSTY_CONDUIT_SSH_SOCKS_BLOCK_WEB_IN_MITM",
-        action = ArgAction::SetTrue,
-        value_parser = clap::builder::BoolishValueParser::new()
-    )]
-    pub socks_block_web_in_mitm: bool,
-
     /// Log level: QUIET, FATAL, ERROR, INFO, DEBUG, VERBOSE (case-insensitive) [default: INFO]
     #[arg(long, value_name = "LEVEL", env = "RUSTY_CONDUIT_SSH_LOG_LEVEL")]
     pub log_level: Option<LogLevel>,
@@ -535,7 +525,7 @@ pub struct CliInput {
     pub args: CliArgs,
     /// `--mitm-ca-passphrase` came from an actual command-line argument (not the env var).
     pub passphrase_from_cli: bool,
-    /// `--socks-block-web` (or alias `--socks-block-web-in-mitm`) was explicitly provided (CLI or env).
+    /// `--socks-block-web` was explicitly provided (CLI or env).
     pub socks_block_web_explicit: bool,
     /// Resolved CLI/env value for `--socks-block-web` when `socks_block_web_explicit` is true.
     pub socks_block_web_value: bool,
@@ -572,15 +562,11 @@ impl CliInput {
         let args = CliArgs::from_arg_matches(matches)?;
         let passphrase_from_cli =
             matches.value_source("mitm_ca_passphrase") == Some(ValueSource::CommandLine);
-        let primary_src = matches.value_source("socks_block_web");
-        let legacy_src = matches.value_source("socks_block_web_in_mitm");
-        let (socks_block_web_explicit, socks_block_web_value) = match (primary_src, legacy_src) {
-            (Some(ValueSource::CommandLine), _) => (true, args.socks_block_web),
-            (_, Some(ValueSource::CommandLine)) => (true, args.socks_block_web_in_mitm),
-            (Some(ValueSource::EnvVariable), _) => (true, args.socks_block_web),
-            (_, Some(ValueSource::EnvVariable)) => (true, args.socks_block_web_in_mitm),
-            _ => (false, false),
-        };
+        let socks_block_web_explicit = matches!(
+            matches.value_source("socks_block_web"),
+            Some(ValueSource::CommandLine | ValueSource::EnvVariable)
+        );
+        let socks_block_web_value = args.socks_block_web;
         let no_reconnect_explicit = matches!(
             matches.value_source("no_reconnect"),
             Some(ValueSource::CommandLine | ValueSource::EnvVariable)
@@ -647,7 +633,6 @@ pub struct FileMitmConfig {
     /// Human-readable duration such as `30m`, `1h`, or `3600s`.
     pub cert_ttl: Option<String>,
     pub cert_cache_max_entries: Option<usize>,
-    pub socks_block_web: Option<bool>,
 }
 
 /// `[logging]` table of the TOML configuration file.
@@ -778,7 +763,7 @@ pub struct Config {
     pub mitm_cert_ttl: Duration,
     /// Maximum cached MITM leaf certificates (`0` = unlimited).
     pub mitm_cert_cache_max_entries: usize,
-    pub socks_block_web_in_mitm: bool,
+    pub socks_block_web: bool,
     pub log_level: LogLevel,
     pub log_format: LogFormat,
     pub http_access_log: Option<PathBuf>,
@@ -834,7 +819,7 @@ impl fmt::Debug for Config {
                 "mitm_cert_cache_max_entries",
                 &self.mitm_cert_cache_max_entries,
             )
-            .field("socks_block_web_in_mitm", &self.socks_block_web_in_mitm)
+            .field("socks_block_web", &self.socks_block_web)
             .field("log_level", &self.log_level)
             .field("log_format", &self.log_format)
             .field("http_access_log", &self.http_access_log)
@@ -892,7 +877,7 @@ impl Default for Config {
             mitm_ca_passphrase_file: None,
             mitm_cert_ttl: DEFAULT_MITM_CERT_TTL,
             mitm_cert_cache_max_entries: DEFAULT_MITM_CERT_CACHE_MAX_ENTRIES,
-            socks_block_web_in_mitm: false,
+            socks_block_web: false,
             log_level: LogLevel::Info,
             log_format: LogFormat::Text,
             http_access_log: None,
@@ -971,12 +956,10 @@ impl Config {
             })
             .transpose()?;
 
-        let socks_block_web_in_mitm = if cli.socks_block_web_explicit {
+        let socks_block_web = if cli.socks_block_web_explicit {
             cli.socks_block_web_value
         } else {
-            file.socks_block_web
-                .or(file.mitm.socks_block_web)
-                .unwrap_or(d.socks_block_web_in_mitm)
+            file.socks_block_web.unwrap_or(d.socks_block_web)
         };
 
         let file_alive = file_duration(
@@ -1087,7 +1070,7 @@ impl Config {
                 .mitm_cert_cache_max_entries
                 .or(file.mitm.cert_cache_max_entries)
                 .unwrap_or(d.mitm_cert_cache_max_entries),
-            socks_block_web_in_mitm,
+            socks_block_web,
             log_level: a.log_level.or(file_level).unwrap_or(d.log_level),
             log_format: a.log_format.or(file_format).unwrap_or(d.log_format),
             http_access_log: a.http_access_log.or(file.logging.http_access_log),
@@ -1386,7 +1369,7 @@ impl Config {
         };
         format!(
             "bind={} http_port={} socks_port={} multiplexed={} max_connections={} tcp_keepalive={keepalive} mitm={} \
-             mitm_cert_ttl={} mitm_cert_cache_max_entries={} socks_block_web_in_mitm={} log_level={} log_format={} http_access_log={} socks_log={} \
+             mitm_cert_ttl={} mitm_cert_cache_max_entries={} socks_block_web={} log_level={} log_format={} http_access_log={} socks_log={} \
              config={} ssh_target={} ssh_bin={} ssh_socks_bind={} ssh_socks_port={} \
              ssh_ip_version={} ssh_server_alive_interval={} ssh_server_alive_count_max={} \
              no_reconnect={} reconnect_initial_delay={} reconnect_max_delay={} \
@@ -1399,7 +1382,7 @@ impl Config {
             mitm,
             humantime::format_duration(self.mitm_cert_ttl),
             cap(self.mitm_cert_cache_max_entries),
-            self.socks_block_web_in_mitm,
+            self.socks_block_web,
             self.log_level,
             self.log_format,
             path(&self.http_access_log),
@@ -1459,7 +1442,6 @@ mod tests {
         "RUSTY_CONDUIT_SSH_MITM_CA_PASSPHRASE_FILE",
         "RUSTY_CONDUIT_SSH_MITM_CERT_TTL",
         "RUSTY_CONDUIT_SSH_SOCKS_BLOCK_WEB",
-        "RUSTY_CONDUIT_SSH_SOCKS_BLOCK_WEB_IN_MITM",
         "RUSTY_CONDUIT_SSH_LOG_LEVEL",
         "RUSTY_CONDUIT_SSH_LOG_FORMAT",
         "RUSTY_CONDUIT_SSH_HTTP_ACCESS_LOG",
@@ -1555,7 +1537,7 @@ mod tests {
         assert_eq!(cfg.mitm_cert_ttl, Duration::from_secs(3600));
         assert_eq!(cfg.log_level, LogLevel::Info);
         assert_eq!(cfg.log_format, LogFormat::Text);
-        assert!(!cfg.socks_block_web_in_mitm);
+        assert!(!cfg.socks_block_web);
         assert!(!cfg.mitm_enabled());
         assert!(!cfg.is_multiplexed());
         assert!(cfg.notices().is_empty());
@@ -1566,11 +1548,12 @@ bind = "10.0.0.1"
 http_port = 1111
 socks_port = 2222
 
+socks_block_web = true
+
 [mitm]
 ca_p12 = "/file/ca.p12"
 ca_passphrase_file = "/file/pass"
 cert_ttl = "30m"
-socks_block_web = true
 
 [logging]
 level = "debug"
@@ -1593,7 +1576,7 @@ socks_log = "/file/socks.log"
             Some(PathBuf::from("/file/pass"))
         );
         assert_eq!(cfg.mitm_cert_ttl, Duration::from_secs(1800));
-        assert!(cfg.socks_block_web_in_mitm);
+        assert!(cfg.socks_block_web);
         assert_eq!(cfg.log_level, LogLevel::Debug);
         assert_eq!(cfg.log_format, LogFormat::Json);
         assert_eq!(cfg.http_access_log, Some(PathBuf::from("/file/http.log")));
@@ -1616,7 +1599,7 @@ socks_log = "/file/socks.log"
             ("RUSTY_CONDUIT_SSH_HTTP_PORT", "3333"),
             ("RUSTY_CONDUIT_SSH_SOCKS_PORT", "4444"),
             ("RUSTY_CONDUIT_SSH_MITM_CERT_TTL", "2h"),
-            ("RUSTY_CONDUIT_SSH_SOCKS_BLOCK_WEB_IN_MITM", "false"),
+            ("RUSTY_CONDUIT_SSH_SOCKS_BLOCK_WEB", "false"),
             ("RUSTY_CONDUIT_SSH_LOG_LEVEL", "VERBOSE"),
             ("RUSTY_CONDUIT_SSH_LOG_FORMAT", "text"),
             ("RUSTY_CONDUIT_SSH_HTTP_ACCESS_LOG", "/env/http.log"),
@@ -1629,10 +1612,7 @@ socks_log = "/file/socks.log"
         assert_eq!(cfg.http_port, 3333);
         assert_eq!(cfg.socks_port, 4444);
         assert_eq!(cfg.mitm_cert_ttl, Duration::from_secs(7200));
-        assert!(
-            !cfg.socks_block_web_in_mitm,
-            "env false overrides toml true"
-        );
+        assert!(!cfg.socks_block_web, "env false overrides toml true");
         assert_eq!(cfg.log_level, LogLevel::Verbose);
         assert_eq!(cfg.log_format, LogFormat::Text);
         assert_eq!(cfg.http_access_log, Some(PathBuf::from("/env/http.log")));
@@ -1702,23 +1682,25 @@ socks_log = "/file/socks.log"
         let _env = EnvGuard::new(&[("RUSTY_CONDUIT_SSH_SOCKS_BLOCK_WEB", "true")]);
         let c = cli(&[]);
         assert!(c.socks_block_web_explicit);
-        assert!(Config::merge(c, None).unwrap().socks_block_web_in_mitm);
+        assert!(Config::merge(c, None).unwrap().socks_block_web);
         drop(_env);
 
+        // The retired env var is ignored.
         let _env = EnvGuard::new(&[("RUSTY_CONDUIT_SSH_SOCKS_BLOCK_WEB_IN_MITM", "true")]);
         let c = cli(&[]);
-        assert!(c.socks_block_web_explicit);
-        assert!(Config::merge(c, None).unwrap().socks_block_web_in_mitm);
+        assert!(!c.socks_block_web_explicit);
+        assert!(!Config::merge(c, None).unwrap().socks_block_web);
         drop(_env);
 
         let _env = EnvGuard::new(&[]);
         let c = cli(&["--socks-block-web"]);
         assert!(c.socks_block_web_explicit);
-        assert!(Config::merge(c, None).unwrap().socks_block_web_in_mitm);
+        assert!(Config::merge(c, None).unwrap().socks_block_web);
 
-        let c = cli(&["--socks-block-web-in-mitm"]);
-        assert!(c.socks_block_web_explicit);
-        assert!(Config::merge(c, None).unwrap().socks_block_web_in_mitm);
+        // The retired flag is rejected.
+        assert!(
+            CliInput::try_parse_from(["rusty-conduit-ssh", "--socks-block-web-in-mitm"]).is_err()
+        );
 
         let c = cli(&[]);
         assert!(!c.socks_block_web_explicit);
@@ -1726,24 +1708,18 @@ socks_log = "/file/socks.log"
             socks_block_web: Some(true),
             ..Default::default()
         };
-        assert!(
-            Config::merge(c.clone(), Some(file))
-                .unwrap()
-                .socks_block_web_in_mitm
-        );
+        assert!(Config::merge(c, Some(file)).unwrap().socks_block_web);
 
-        let legacy_file = FileConfig {
-            mitm: FileMitmConfig {
-                socks_block_web: Some(true),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        assert!(
-            Config::merge(c, Some(legacy_file))
-                .unwrap()
-                .socks_block_web_in_mitm
-        );
+        // The retired `[mitm] socks_block_web` key is an unknown field.
+        let err = FileConfig::from_toml_str(
+            "[mitm]
+socks_block_web = true
+",
+            Path::new("x.toml"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("socks_block_web"), "{err}");
     }
 
     #[test]
@@ -1944,11 +1920,7 @@ socks_log = "/file/socks.log"
     fn socks_block_web_works_without_mitm_no_inactive_notice() {
         let _env = EnvGuard::new(&[]);
         let cfg = load(&["--socks-block-web"]).unwrap();
-        assert!(cfg.socks_block_web_in_mitm);
-        assert!(cfg.notices().is_empty());
-
-        let cfg = load(&["--socks-block-web-in-mitm"]).unwrap();
-        assert!(cfg.socks_block_web_in_mitm);
+        assert!(cfg.socks_block_web);
         assert!(cfg.notices().is_empty());
     }
 

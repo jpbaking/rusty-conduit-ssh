@@ -1,4 +1,4 @@
-//! End-to-end HTTPS MITM tests (HTTP/1.1 and HTTP/2) and `--socks-block-web-in-mitm`, routed
+//! End-to-end HTTPS MITM tests (HTTP/1.1 and HTTP/2) and `--socks-block-web`, routed
 //! through the production SOCKS5 dialer to a mock `ssh -D` listener.
 
 mod common;
