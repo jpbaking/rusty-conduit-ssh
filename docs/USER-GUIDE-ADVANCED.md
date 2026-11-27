@@ -1,6 +1,6 @@
 # Advanced User Guide & Configuration Reference
 
-This guide covers configuring and operating `rusty-conduit-ssh` in depth: configuration precedence and the full reference, SSH launch details, reconnect and keepalive tuning, DNS behavior, HTTPS MITM, the reverse proxy, logging, and a security checklist.
+This guide covers configuring and operating `rusty-conduit-ssh` in depth: configuration precedence and the full reference, SSH launch details, reconnect and keepalive tuning, DNS behavior, HTTPS MITM, the reverse proxy, logging, custom proxy error pages, and a security checklist.
 
 - New to `rusty-conduit-ssh`? Start with the **[Basic User Guide](USER-GUIDE-BASIC.md)**.
 - For RAM/CPU budgets, `ulimit -n` and `somaxconn` limits, and cap mechanics, see **[Performance, Footprint & Sizing](PERFORMANCE-AND-SIZING.md)**.
@@ -93,7 +93,15 @@ See [Reverse proxy](#7-reverse-proxy-ssh--r) for behavior and security guidance.
 | `--mitm-ca-passphrase-file <PATH>` | `MITM_CA_PASSPHRASE_FILE` | `mitm.ca_passphrase_file` | none | File holding the passphrase, trailing newline trimmed |
 | `--mitm-cert-ttl <DURATION>` | `MITM_CERT_TTL` | `mitm.cert_ttl` | `1h` | Leaf certificate TTL, minimum `10s` |
 | `--mitm-cert-cache-max-entries <N>` | `MITM_CERT_CACHE_MAX_ENTRIES` | `mitm.cert_cache_max_entries` | `10240` | Leaf cache cap, `0` = unlimited |
+| `--mitm-insecure-host <RULE>` | `MITM_INSECURE_HOST` | `mitm.insecure_hosts` | none | Under MITM, accept invalid/self-signed upstream TLS certs for matching destinations (IP, CIDR, FQDN, or `*.domain`; same syntax as `--allow`). Repeatable or comma-separated; CLI/env replaces the TOML list. An invalid rule is a fatal error |
+| `--mitm-insecure` | `MITM_INSECURE` | `mitm.insecure` | `false` | **Unsafe** blind trust: skip upstream TLS certificate verification for ALL MITM targets. Enabled if set in CLI/env **or** TOML; takes precedence over `--mitm-insecure-host` |
 | `--socks-block-web` | `SOCKS_BLOCK_WEB` | `socks_block_web` | `false` | Reject HTTP/HTTPS traffic over SOCKS4/4a/5 (works with or without MITM). |
+
+### Error pages
+
+| CLI flag | Env (after prefix) | TOML key | Default | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| `--error-page <PATH>` | `ERROR_PAGE` | `error_page` | built-in page | HTML template for proxy-generated HTTP error pages on the forward and reverse proxies (placeholders `{{status}}`, `{{reason}}`, `{{message}}`, `{{target}}`). Upstream responses are never altered. An unreadable file is a fatal error. See [Custom proxy error pages](#9-custom-proxy-error-pages) |
 
 ### Logging
 
@@ -117,13 +125,13 @@ rusty-conduit-ssh --http-port 8080 validate myhost --config proxy.toml
 
 Other flags go before the subcommand; only `--config` may follow it.
 
-- On success, it prints `config OK: <path|none> target=<target>` (followed by any startup `NOTICE:` lines) to `stdout` and exits `0`.
+- On success, it prints `config OK: <path|none> target=<target>` (followed by any startup `NOTICE:` and MITM `WARN:` lines) to `stdout` and exits `0`.
 - On failure, it prints `config invalid: <error>` to `stderr` and exits `1`.
-- It also checks what startup checks before launching `ssh`: the MITM CA (files, passphrase, validity, and that the key matches the certificate), that each log file can be opened (without creating it), that the `ssh` program exists, that the `-i` key and `-F` config can be read, and that `ssh -G` accepts the configuration for the target. `ssh -G` evaluates the SSH config and exits without connecting. It prints the open-file `NOTICE` startup would log, too.
+- It also checks what startup checks before launching `ssh`: the MITM CA (files, passphrase, validity, and that the key matches the certificate), that each log file can be opened (without creating it), that the `--error-page` template can be read, that the `ssh` program exists, that the `-i` key and `-F` config can be read, and that `ssh -G` accepts the configuration for the target. `ssh -G` evaluates the SSH config and exits without connecting. It prints the open-file `NOTICE` startup would log, too.
 - `--settings-only` skips those checks, for checking a config away from the host it runs on, for example in CI: `rusty-conduit-ssh validate myhost --settings-only --config proxy.toml`.
 - If you have an SSH host alias literally named `validate`, pass it with `--target validate` so it is not parsed as the subcommand.
 
-Startup runs the same checks before it launches `ssh`. A missing key, an unreadable or broken SSH config, or a bad CA stops the proxy at once with one `FATAL` line, instead of turning into failed logins and reconnects against the SSH server.
+Startup runs the same checks before it launches `ssh`. A missing key, an unreadable or broken SSH config, an unreadable `--error-page` file, or a bad CA stops the proxy at once with one `FATAL` line, instead of turning into failed logins and reconnects against the SSH server.
 
 **Exit codes:** `0` for a clean exit, `1` for a fatal startup or runtime error, and `2` for a command-line usage error.
 
@@ -139,6 +147,8 @@ http_port = 3128
 socks_port = 1080
 max_connections = 4096
 socks_block_web = false
+# Optional custom HTML template for proxy-generated error pages (default: built-in page):
+# error_page = "/etc/rusty-conduit-ssh/error.html"
 tcp_keepalive = "60s"          # "0" disables
 tcp_keepalive_interval = "10s"
 tcp_keepalive_retries = 5
@@ -179,6 +189,10 @@ socks_port = 0
 # ca_passphrase_file = "/etc/rusty-conduit-ssh/ca.pass"
 cert_ttl = "1h"
 cert_cache_max_entries = 10240
+# Skip upstream TLS verification only for these lab / self-signed origins:
+# insecure_hosts = ["dev.internal", "*.lab.example", "10.20.0.0/16"]
+# UNSAFE: skip upstream TLS verification for every destination:
+# insecure = false
 
 [logging]
 level = "INFO"
@@ -336,7 +350,10 @@ The CA is checked at startup, before SSH authentication. An unparsable or expire
 ### How interception behaves
 
 - MITM applies to HTTPS requests made through the **HTTP proxy** with `CONNECT`. HTTP/1.1 and HTTP/2 are supported.
-- Upstream certificates are verified against the platform trust store.
+- Upstream certificates are verified against the platform trust store; an invalid origin certificate fails the request (`status=502`). The startup `config:` line shows the mode as `mitm_upstream_tls=strict|insecure_hosts(N)|insecure_all`. The same mode applies to the forward and the reverse proxy:
+  - `--mitm-insecure-host <RULE>` accepts invalid or self-signed certificates only for matching targets (exact domain, `*.domain`, IP, or CIDR); every other target is still verified.
+  - `--mitm-insecure` accepts any upstream certificate for every target (blind trust). Use it only on isolated test networks: anyone on the path to the origin can impersonate it.
+  - While MITM is enabled, either option logs a `WARN:` line at startup (at `INFO`), and `validate` prints it too: blind trust says certificates are not verified for any destination; the host list names the count and the rules.
 - Leaf certificates are cached in memory only, bounded by `--mitm-cert-ttl` and `--mitm-cert-cache-max-entries`.
 - SOCKS traffic is not intercepted. To stop web traffic bypassing inspection over SOCKS, add `--socks-block-web`. Blocked sessions are closed and logged with `status=blocked_web_in_mitm`, while non-web protocols such as SSH or Postgres pass through.
 
@@ -447,7 +464,39 @@ rusty-conduit-ssh my-bastion --reverse-http-port 8888 --log-level DEBUG --log-fo
 
 ---
 
-## 9. Security checklist
+## 9. Custom proxy error pages
+
+When `rusty-conduit-ssh` itself answers an HTTP request with an error, such as a malformed request (`400`), a destination denied by `--allow` / `--block` / `--reverse-allow` / `--reverse-block` (`403`), an upstream it cannot reach or verify (`502`), or a timeout (`504`), it sends an HTML page. By default this is a small, unbranded built-in page. Replace it with your own template:
+
+```sh
+rusty-conduit-ssh my-bastion --error-page /etc/rusty-conduit-ssh/error.html
+# or: RUSTY_CONDUIT_SSH_ERROR_PAGE=/etc/rusty-conduit-ssh/error.html
+# or, in the TOML file (top level): error_page = "/etc/rusty-conduit-ssh/error.html"
+```
+
+The template is a UTF-8 file read once at startup. These placeholders are replaced in every page, and every value is HTML-escaped:
+
+| Placeholder | Value |
+| :--- | :--- |
+| `{{status}}` | Numeric status code, for example `502` |
+| `{{reason}}` | Standard reason phrase, for example `Bad Gateway` |
+| `{{message}}` | The proxy's explanation of the error |
+| `{{target}}` | The requested URL or `host:port` (never includes userinfo); empty when unknown |
+
+```html
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>{{status}} {{reason}}</title></head>
+<body><h1>{{status}} {{reason}}</h1><p>{{message}}</p><p><code>{{target}}</code></p></body></html>
+```
+
+- The template applies to every proxy-generated HTTP error on both the forward proxy and the reverse proxy (`ssh -R`): plain forwarding, `CONNECT`, and decrypted MITM requests. Pages are sent as `text/html; charset=utf-8` with `Cache-Control: no-store`.
+- **Responses from an upstream origin are never altered**, error statuses included: a `404` or `500` from the origin reaches the client exactly as sent.
+- SOCKS has no HTTP error responses, so the template does not apply to it.
+- The startup `config:` line shows `error_page=<path>` or `error_page=builtin`. An unreadable file is a `FATAL` startup error, reported before `ssh` is launched; `validate` reports it too, unless `--settings-only`.
+
+---
+
+## 10. Security checklist
 
 - Keep `--bind` on loopback unless a firewall restricts access. There is **no proxy authentication**, and a non-loopback bind logs a security notice at startup.
 - Keep `--reverse-bind` on loopback. The reverse proxy gives its clients access to whatever your machine can reach, including its loopback services.

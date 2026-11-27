@@ -14,7 +14,8 @@
 - **Every protocol on your side:** Plain HTTP forwarding, HTTPS `CONNECT`, SOCKS4, SOCKS4a, and SOCKS5, on separate ports (`3128` / `1080`) or **auto-multiplexed on one port**.
 - **No local DNS lookups for proxied hosts:** Hostnames are handed to the tunnel as names and resolved on the SSH target.
 - **Optional reverse proxy (`ssh -R`):** The same process and SSH connection can also expose an HTTP/HTTPS and SOCKS proxy on the SSH target, so clients there egress through your machine.
-- **Opt-in HTTPS MITM:** Off by default and never auto-generates a CA. Bring a PEM or PKCS#12 CA to inspect HTTP/1.1 and HTTP/2 traffic. TLS is pure Rust (`rustls` + `ring`), with no OpenSSL.
+- **Opt-in HTTPS MITM:** Off by default and never auto-generates a CA. Bring a PEM or PKCS#12 CA to inspect HTTP/1.1 and HTTP/2 traffic. TLS is pure Rust (`rustls` + `ring`), with no OpenSSL. Upstream certificates are verified strictly by default; for lab or self-signed origins, `--mitm-insecure-host <RULE>` (TOML `[mitm] insecure_hosts`) skips verification only for matching hosts, IPs, or CIDRs, and `--mitm-insecure` (TOML `[mitm] insecure = true`) blindly trusts every upstream — **unsafe**, and logged as a startup warning.
+- **Your own error pages:** Swap the built-in HTML for proxy-generated errors (`400`, `403`, `502`, `504`, …) on the forward and reverse proxies with `--error-page <PATH>` (`RUSTY_CONDUIT_SSH_ERROR_PAGE`, TOML `error_page`), using the `{{status}}`, `{{reason}}`, `{{message}}`, and `{{target}}` placeholders (HTML-escaped). Responses from upstream origins are never altered.
 - **Survives long silent connections:** No idle timeout on established connections, plus TCP keepalive on forward and reverse sockets (default `60s` idle, then `10s` × `5` probes), so NAT, firewalls, and VPNs don't drop agents waiting on slow responses.
 - **Built for operators:** `CLI > env > TOML` configuration, six log levels, `text` (logfmt) or `json` (NDJSON) access logs, graceful shutdown, and connection and certificate-cache caps.
 
@@ -130,7 +131,7 @@ curl --socks5-hostname 127.0.0.1:8888 https://example.com/
 | Guide | What's inside |
 | :--- | :--- |
 | **[Basic User Guide](docs/USER-GUIDE-BASIC.md)** | Installing, connecting browsers and CLI tools, SSH login basics, everyday options, and sharing your connection with the SSH target |
-| **[Advanced User Guide](docs/USER-GUIDE-ADVANCED.md)** | Full CLI/env/TOML reference, SSH launch details, reconnect and keepalive tuning, DNS behavior, HTTPS MITM, the reverse proxy, logging, and a security checklist |
+| **[Advanced User Guide](docs/USER-GUIDE-ADVANCED.md)** | Full CLI/env/TOML reference, SSH launch details, reconnect and keepalive tuning, DNS behavior, HTTPS MITM, the reverse proxy, logging, custom error pages, and a security checklist |
 | **[MITM CA Guide](docs/MITM-CA-GUIDE.md)** | Generating your own PEM or PKCS#12 CA with `openssl` and trusting it on Linux, macOS, Windows, and Firefox |
 | **[Performance, Footprint & Sizing](docs/PERFORMANCE-AND-SIZING.md)** | Measured CPU/RAM footprint of the proxy and its `ssh` process, `ulimit -n` and `somaxconn` limits, sizing, and resource caps |
 | **[Docker Guide](docs/DOCKER-GUIDE.md)** | Images, giving the container its SSH files, `docker run` and Compose examples, the reverse proxy, MITM, limits, and health checks |

@@ -29,7 +29,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use config::{CliInput, Command, Config};
-use http::HttpProxy;
+use http::{ErrorPageTemplate, HttpProxy};
 use logging::{AccessLogConfig, AccessLogger, LogLevel, Logger, ProxyDirection};
 use mitm::MitmState;
 use net::{Socks5UpstreamDialer, UpstreamDialer, DEFAULT_CONNECT_TIMEOUT};
@@ -102,7 +102,7 @@ pub fn load_config(cli: CliInput) -> Result<Config, (config::ConfigError, LogLev
     Ok(cfg)
 }
 
-/// Emit the startup banner, configuration summary, and any `INFO` notices.
+/// Emit the startup banner, configuration summary, `INFO` notices, and MITM upstream-TLS warnings.
 pub fn log_startup(cfg: &Config, logger: &Logger) {
     logger.info(format!(
         "rusty-conduit-ssh v{} starting",
@@ -111,6 +111,9 @@ pub fn log_startup(cfg: &Config, logger: &Logger) {
     logger.info(format!("config: {}", cfg.summary()));
     for notice in cfg.notices() {
         logger.info(notice);
+    }
+    for warning in cfg.mitm_tls_warnings() {
+        logger.info(warning);
     }
 }
 
@@ -173,8 +176,19 @@ pub async fn run_until(cfg: Config, logger: Logger, interrupted: CancellationTok
         }
     };
 
-    // Fail on local problems before `ssh` starts, so a bad CA, key, or SSH config never
-    // costs a connection attempt (or a retry loop) against the SSH server.
+    // Fail on local problems before `ssh` starts, so a bad error page, CA, key, or SSH
+    // config never costs a connection attempt (or a retry loop) against the SSH server.
+    let error_page = match cfg.error_page_template() {
+        Ok(t) => t,
+        Err(e) => {
+            logger.fatal(format!("config invalid: {e}"));
+            if let Err(e) = access.shutdown().await {
+                logger.error(format!("failed to flush access logs: {e}"));
+            }
+            logger.flush();
+            return ExitCode::from(EXIT_FATAL);
+        }
+    };
     if let Err(e) = preflight_before_ssh(&cfg, &tunnel_cfg) {
         logger.fatal(e);
         if let Err(e) = access.shutdown().await {
@@ -185,7 +199,7 @@ pub async fn run_until(cfg: Config, logger: Logger, interrupted: CancellationTok
     }
 
     // Bound before `ssh` starts so the `-R` targets are known and survive reconnects.
-    let reverse = match ReverseProxy::start(&cfg, &access, &logger).await {
+    let reverse = match ReverseProxy::start(&cfg, &access, &logger, &error_page).await {
         Ok(reverse) => reverse,
         Err(message) => {
             logger.fatal(message);
@@ -211,7 +225,10 @@ pub async fn run_until(cfg: Config, logger: Logger, interrupted: CancellationTok
         &logger,
         &access,
         &ssh,
-        dialer,
+        ForwardInputs {
+            dialer,
+            error_page: &error_page,
+        },
         &tunnel_lost,
         &interrupted,
     )
@@ -237,6 +254,12 @@ pub async fn run_until(cfg: Config, logger: Logger, interrupted: CancellationTok
     code
 }
 
+/// What the forward engines are built from: the tunnel dialer and the loaded error page.
+struct ForwardInputs<'a> {
+    dialer: Arc<dyn UpstreamDialer>,
+    error_page: &'a ErrorPageTemplate,
+}
+
 /// Wait for the tunnel, then bind and run the server until it has drained. An `Err` is a
 /// `FATAL` startup failure; a signal during startup is a clean exit.
 async fn serve(
@@ -244,7 +267,7 @@ async fn serve(
     logger: &Logger,
     access: &AccessLogger,
     ssh: &SshHandle,
-    dialer: Arc<dyn UpstreamDialer>,
+    forward: ForwardInputs<'_>,
     tunnel_lost: &CancellationToken,
     interrupted: &CancellationToken,
 ) -> Result<(), String> {
@@ -276,11 +299,18 @@ async fn serve(
         return Ok(());
     }
 
-    let routing = forward_routing(cfg, dialer)
+    let routing = forward_routing(cfg, forward.dialer)
         .map_err(|e| format!("forward routing setup failed: {e}"))?
         .shared();
     let access = access.clone().with_direction(ProxyDirection::Forward);
-    let (http, socks) = build_engines_with(cfg, mitm.as_ref(), &access, logger, routing);
+    let (http, socks) = build_engines_with(
+        cfg,
+        mitm.as_ref(),
+        &access,
+        logger,
+        routing,
+        forward.error_page.clone(),
+    );
     let handlers: Arc<dyn ProtocolHandlers> = Arc::new(EngineHandlers::new(http, socks));
     let server = Server::from_options(&cfg.server_options(), handlers, logger.clone())
         .await
@@ -316,7 +346,13 @@ async fn serve(
 /// Build the forward HTTP and SOCKS engines, all dialing through `dialer` (see
 /// [`forward_routing`]) and logging with `direction=forward`, enabling HTTPS interception
 /// when `mitm` is present and the SOCKS web guard when additionally
-/// `--socks-block-web` is set.
+/// `--socks-block-web` is set, and the `--error-page` template (or the built-in page) for
+/// proxy-generated HTTP errors.
+///
+/// # Panics
+///
+/// If the `--error-page` file cannot be read; [`run`] reports that error via
+/// [`Config::error_page_template`] instead.
 pub fn build_engines(
     cfg: &Config,
     mitm: Option<&MitmState>,
@@ -328,22 +364,30 @@ pub fn build_engines(
         .expect("the fixed single-profile forward routing always compiles")
         .shared();
     let access = access.clone().with_direction(ProxyDirection::Forward);
-    build_engines_with(cfg, mitm, &access, logger, routing)
+    let error_page = cfg.error_page_template().unwrap_or_else(|e| panic!("{e}"));
+    build_engines_with(cfg, mitm, &access, logger, routing, error_page)
 }
 
 /// Build the HTTP and SOCKS engines over `routing`, logging through `access` (already tagged
-/// with its direction) in the rusty-conduit-ssh schema (no routing fields), with MITM and the
-/// SOCKS web guard as for [`build_engines`].
+/// with its direction) in the rusty-conduit-ssh schema (no routing fields), with MITM, the
+/// SOCKS web guard, and the loaded `error_page` as for [`build_engines`].
 pub(crate) fn build_engines_with(
     cfg: &Config,
     mitm: Option<&MitmState>,
     access: &AccessLogger,
     logger: &Logger,
     routing: SharedRouting,
+    error_page: ErrorPageTemplate,
 ) -> (HttpProxy, SocksProxy) {
-    let access = &access.clone().with_routing_fields(false);
-    let mut http = HttpProxy::new(Arc::clone(&routing), access.clone(), logger.clone());
-    let mut socks = SocksProxy::new(routing, access.clone(), logger.clone());
+    let access = access.clone().with_routing_fields(false);
+    if let Some(path) = &cfg.error_page {
+        logger.info(format!("custom error page enabled: {}", path.display()));
+    }
+    // Only proxy-generated errors use the template; upstream responses pass through untouched.
+    let engines =
+        EngineHandlers::from_routing(routing, access, logger.clone()).with_error_page(error_page);
+    let mut http = engines.http_engine().clone();
+    let mut socks = engines.socks_engine().clone();
     if let Some(m) = mitm {
         logger.info(format!(
             "MITM enabled: CA \"{}\" valid until {}; leaf certificate TTL {}",
@@ -404,8 +448,8 @@ pub fn preflight_before_ssh(cfg: &Config, tunnel: &SshTunnelConfig) -> Result<()
     ssh::check_ssh_setup(tunnel)
 }
 
-/// Every offline check startup would fail on, in startup order: the access logs, then
-/// [`preflight_before_ssh`].
+/// Every offline check startup would fail on, in startup order: the access logs, the
+/// `--error-page` template, then [`preflight_before_ssh`].
 pub fn preflight_checks(cfg: &Config) -> Result<(), String> {
     let tunnel = SshTunnelConfig::from_config(cfg).map_err(|e| e.to_string())?;
     if let Some(path) = &cfg.http_access_log {
@@ -414,6 +458,7 @@ pub fn preflight_checks(cfg: &Config) -> Result<(), String> {
     if let Some(path) = &cfg.socks_log {
         preflight::check_log_path("--socks-log", path)?;
     }
+    cfg.error_page_template()?;
     preflight_before_ssh(cfg, &tunnel)
 }
 
@@ -450,6 +495,9 @@ pub fn cmd_validate(mut cli: CliInput, out: &mut dyn Write, err: &mut dyn Write)
             let _ = writeln!(out, "config OK: {path} target={target}");
             for notice in cfg.notices() {
                 let _ = writeln!(out, "{notice}");
+            }
+            for warning in cfg.mitm_tls_warnings() {
+                let _ = writeln!(out, "{warning}");
             }
             if !settings_only {
                 let (connections, flag) = fd_budget(&cfg);
@@ -860,5 +908,133 @@ mod tests {
             fd_budget(&cfg),
             (cfg.reverse_max_connections, "--reverse-max-connections")
         );
+    }
+
+    /// Write sink shared with the test, for reading back `Logger` output.
+    #[derive(Clone, Default)]
+    struct SharedOut(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedOut {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn missing_error_page() -> std::path::PathBuf {
+        std::env::temp_dir().join("rusty-conduit-ssh-missing-error-page.html")
+    }
+
+    #[test]
+    fn missing_error_page_fails_preflight_naming_the_path() {
+        let missing = missing_error_page();
+        let cfg = Config {
+            ssh_target: Some("user@example.invalid".into()),
+            error_page: Some(missing.clone()),
+            ..Config::default()
+        };
+        cfg.validate()
+            .expect("settings alone stay valid (--settings-only)");
+        let err = preflight_checks(&cfg).unwrap_err();
+        assert!(
+            err.starts_with(&format!("cannot read --error-page {}", missing.display())),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_error_page_fails_startup_with_fatal_exit() {
+        let missing = missing_error_page();
+        let cfg = Config {
+            ssh_target: Some("user@example.invalid".into()),
+            ssh_bin: "/nonexistent/rusty-conduit-ssh-test-ssh".into(),
+            no_reconnect: true,
+            error_page: Some(missing.clone()),
+            ..Config::default()
+        };
+        let out = SharedOut::default();
+        let logger = Logger::with_writer(LogLevel::Fatal, Box::new(out.clone()));
+        assert_eq!(run(cfg, logger).await, ExitCode::from(EXIT_FATAL));
+        let log = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
+        // The error page is checked before the `ssh` setup, so it is the reported failure.
+        assert!(
+            log.contains(&format!(
+                "config invalid: cannot read --error-page {}",
+                missing.display()
+            )),
+            "{log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_engines_installs_the_error_page() {
+        let page = std::env::temp_dir().join(format!(
+            "rusty-conduit-ssh-error-page-{}.html",
+            std::process::id()
+        ));
+        std::fs::write(&page, "<p>custom {{status}} {{reason}} [{{target}}]</p>").unwrap();
+        let cfg = Config {
+            error_page: Some(page.clone()),
+            ..Config::default()
+        };
+        let (access, _buf) = capture_access().await;
+        let (http, _socks) = build_engines(&cfg, None, &access, &quiet_logger(), direct_dialer());
+        assert!(!http.error_page().is_builtin());
+        assert_eq!(
+            http.error_page().as_str(),
+            "<p>custom {{status}} {{reason}} [{{target}}]</p>"
+        );
+        let (http, _socks) = build_engines(
+            &Config::default(),
+            None,
+            &access,
+            &quiet_logger(),
+            direct_dialer(),
+        );
+        assert!(http.error_page().is_builtin());
+        let _ = std::fs::remove_file(&page);
+    }
+
+    /// The reverse proxy renders its own errors with the template; origin responses pass
+    /// through untouched.
+    #[tokio::test]
+    async fn reverse_proxy_uses_the_error_page() {
+        let origin = spawn_origin().await;
+        let cfg = Config {
+            reverse_http_port: 18080,
+            reverse_block: vec!["blocked.invalid".parse().unwrap()],
+            ..Config::default()
+        };
+        let template = ErrorPageTemplate::from_template("<p>custom {{status}} [{{target}}]</p>");
+        let (access, _log) = capture_access().await;
+        let reverse = ReverseProxy::start(&cfg, &access, &quiet_logger(), &template)
+            .await
+            .unwrap()
+            .expect("reverse proxy enabled");
+        let addr = reverse.forwards()[0].local;
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(
+                b"GET http://blocked.invalid/x HTTP/1.1\r\nHost: blocked.invalid\r\n\
+                  Connection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).await.unwrap();
+        assert!(resp.starts_with("HTTP/1.1 403"), "{resp}");
+        assert!(
+            resp.ends_with("<p>custom 403 [blocked.invalid]</p>"),
+            "{resp}"
+        );
+
+        let resp = proxied_get(addr, origin).await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "{resp}");
+        assert!(resp.ends_with("origin"), "{resp}");
+        reverse.shutdown().await;
     }
 }

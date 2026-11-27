@@ -18,6 +18,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
+use crate::http::ErrorPageTemplate;
 use crate::logging::{AccessLogger, Logger, ProxyDirection};
 use crate::mitm::MitmState;
 use crate::net::DEFAULT_CONNECT_TIMEOUT;
@@ -69,6 +70,7 @@ pub struct ReverseProxy {
 
 impl ReverseProxy {
     /// Bind and start serving, or return `Ok(None)` when no reverse port is configured.
+    /// Proxy-generated HTTP errors render with `error_page`.
     ///
     /// Call this before starting `ssh`, so [`Self::forwards`] can be passed as `-R` arguments.
     /// An `Err` is a `FATAL` startup failure.
@@ -76,6 +78,7 @@ impl ReverseProxy {
         cfg: &Config,
         access: &AccessLogger,
         logger: &Logger,
+        error_page: &ErrorPageTemplate,
     ) -> Result<Option<Self>, String> {
         if !cfg.reverse_enabled() {
             return Ok(None);
@@ -92,7 +95,14 @@ impl ReverseProxy {
         }
 
         let access = access.clone().with_direction(ProxyDirection::Reverse);
-        let (http, socks) = build_engines_with(cfg, mitm.as_ref(), &access, logger, routing);
+        let (http, socks) = build_engines_with(
+            cfg,
+            mitm.as_ref(),
+            &access,
+            logger,
+            routing,
+            error_page.clone(),
+        );
         let handlers: Arc<dyn ProtocolHandlers> = Arc::new(EngineHandlers::new(http, socks));
         let server = Server::bind(reverse_listen_plan(cfg), handlers, logger.clone())
             .await
