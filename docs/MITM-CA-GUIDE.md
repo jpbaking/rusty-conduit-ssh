@@ -180,6 +180,11 @@ check only for matching hosts, `*.domain` wildcards, IPs, or CIDRs, and `--mitm-
 (TOML `[mitm] insecure = true`) skips it for every destination. Blind trust is **unsafe**:
 anyone on the path to the origin can impersonate it. Both log a `WARN:` line at startup.
 
+To leave some destinations uninspected — certificate-pinned apps, banking, or anything you
+must not decrypt — list them with `--mitm-bypass-host <RULE>` (TOML `[mitm] bypass_hosts`),
+using the same host, `*.domain`, IP, or CIDR syntax. Matching `CONNECT` requests become an
+opaque end-to-end TLS tunnel, so clients see the origin's real certificate.
+
 ### 3.1 MITM, SOCKS, and the reverse proxy
 
 The CA is loaded and checked at startup, before SSH authentication, so a bad CA fails fast.

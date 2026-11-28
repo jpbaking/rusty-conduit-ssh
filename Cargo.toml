@@ -1,6 +1,6 @@
 [package]
 name = "rusty-conduit-ssh"
-version = "2.2.1"
+version = "2.3.0"
 edition = "2021"
 description = "Single-binary HTTP/HTTPS and SOCKS4/4a/5 forward proxy that routes all upstream traffic and DNS through an auto-reconnecting SSH dynamic tunnel"
 license = "BSD-3-Clause"
@@ -17,7 +17,7 @@ path = "src/main.rs"
 # Shared proxy engine: listeners, mux, HTTP/HTTPS, SOCKS4/4a/5, MITM, filter, logging,
 # routing, and upstream dialers. `default-features = false`: rusty-conduit-ssh has no
 # routing rules, so the regex-based rule matcher (`routing` feature) is not needed.
-rusty-conduit-engine = { git = "https://github.com/jpbaking/rusty-conduit-engine", tag = "v0.5.1", default-features = false }
+rusty-conduit-engine = { git = "https://github.com/jpbaking/rusty-conduit-engine", tag = "v0.6.0", default-features = false }
 
 # Async runtime & utilities
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal", "fs", "io-std", "process"] }

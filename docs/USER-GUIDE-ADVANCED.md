@@ -30,6 +30,7 @@ Environment variable names below omit the `RUSTY_CONDUIT_SSH_` prefix. For examp
 | :--- | :--- | :--- | :--- | :--- |
 | `[TARGET]`, `--target <TARGET>` | `TARGET` | `ssh.target` | required | SSH destination: host, `user@host`, or `~/.ssh/config` alias |
 | `--config <PATH>` | `CONFIG` | n/a | none | TOML configuration file |
+| `-V`, `--version` | n/a | n/a | n/a | Print the version and exit. Release builds print the release tag without its `v` (for example `2.3.0` or `2.3.0-beta.1`); local source builds print `<crate version>-dev` |
 | `--bind <IP>` | `BIND` | `bind` | `127.0.0.1` | IPv4 or IPv6 listener address |
 | `--http-port <PORT>` | `HTTP_PORT` | `http_port` | `3128` | HTTP/HTTPS port, `0` disables |
 | `--socks-port <PORT>` | `SOCKS_PORT` | `socks_port` | `1080` | SOCKS4/4a/5 port, `0` disables |
@@ -94,6 +95,7 @@ See [Reverse proxy](#7-reverse-proxy-ssh--r) for behavior and security guidance.
 | `--mitm-cert-ttl <DURATION>` | `MITM_CERT_TTL` | `mitm.cert_ttl` | `1h` | Leaf certificate TTL, minimum `10s` |
 | `--mitm-cert-cache-max-entries <N>` | `MITM_CERT_CACHE_MAX_ENTRIES` | `mitm.cert_cache_max_entries` | `10240` | Leaf cache cap, `0` = unlimited |
 | `--mitm-insecure-host <RULE>` | `MITM_INSECURE_HOST` | `mitm.insecure_hosts` | none | Under MITM, accept invalid/self-signed upstream TLS certs for matching destinations (IP, CIDR, FQDN, or `*.domain`; same syntax as `--allow`). Repeatable or comma-separated; CLI/env replaces the TOML list. An invalid rule is a fatal error |
+| `--mitm-bypass-host <RULE>` | `MITM_BYPASS_HOST` | `mitm.bypass_hosts` | none | Under MITM, never intercept matching destinations (IP, CIDR, FQDN, or `*.domain`; same syntax as `--allow`): their `CONNECT` stays an opaque end-to-end TLS tunnel. Use it for certificate-pinned or sensitive sites. Repeatable or comma-separated; CLI/env replaces the TOML list. An invalid rule is a fatal error |
 | `--mitm-insecure` | `MITM_INSECURE` | `mitm.insecure` | `false` | **Unsafe** blind trust: skip upstream TLS certificate verification for ALL MITM targets. Enabled if set in CLI/env **or** TOML; takes precedence over `--mitm-insecure-host` |
 | `--socks-block-web` | `SOCKS_BLOCK_WEB` | `socks_block_web` | `false` | Reject HTTP/HTTPS traffic over SOCKS4/4a/5 (works with or without MITM). |
 
@@ -191,6 +193,8 @@ cert_ttl = "1h"
 cert_cache_max_entries = 10240
 # Skip upstream TLS verification only for these lab / self-signed origins:
 # insecure_hosts = ["dev.internal", "*.lab.example", "10.20.0.0/16"]
+# Never intercept these destinations (opaque CONNECT tunnel instead):
+# bypass_hosts = ["bank.example", "*.pinned.example", "203.0.113.0/24"]
 # UNSAFE: skip upstream TLS verification for every destination:
 # insecure = false
 
@@ -354,6 +358,7 @@ The CA is checked at startup, before SSH authentication. An unparsable or expire
   - `--mitm-insecure-host <RULE>` accepts invalid or self-signed certificates only for matching targets (exact domain, `*.domain`, IP, or CIDR); every other target is still verified.
   - `--mitm-insecure` accepts any upstream certificate for every target (blind trust). Use it only on isolated test networks: anyone on the path to the origin can impersonate it.
   - While MITM is enabled, either option logs a `WARN:` line at startup (at `INFO`), and `validate` prints it too: blind trust says certificates are not verified for any destination; the host list names the count and the rules.
+- `--mitm-bypass-host <RULE>` excludes matching `CONNECT` targets (exact domain, `*.domain`, IP, or CIDR) from interception: they get an opaque tunnel, no leaf certificate is minted, and clients need not trust the CA for them. Bypass applies to the forward and the reverse proxy. The startup `config:` line shows the rule count as `mitm_bypass_hosts=N`.
 - Leaf certificates are cached in memory only, bounded by `--mitm-cert-ttl` and `--mitm-cert-cache-max-entries`.
 - SOCKS traffic is not intercepted. To stop web traffic bypassing inspection over SOCKS, add `--socks-block-web`. Blocked sessions are closed and logged with `status=blocked_web_in_mitm`, while non-web protocols such as SSH or Postgres pass through.
 

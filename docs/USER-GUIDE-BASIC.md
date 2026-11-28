@@ -20,7 +20,7 @@ Grab the archive for your OS and CPU architecture from the [GitHub Releases](htt
 - **macOS:** `rusty-conduit-ssh-<version>-macos-arm64.tar.gz` (Apple Silicon) or `macos-amd64.tar.gz` (Intel)
 - **Windows:** `rusty-conduit-ssh-<version>-windows-amd64.zip` or `windows-arm64.zip`
 
-Extract it and place `rusty-conduit-ssh` (or `rusty-conduit-ssh.exe`) somewhere on your `PATH`.
+Extract it and place `rusty-conduit-ssh` (or `rusty-conduit-ssh.exe`) somewhere on your `PATH`. Run `rusty-conduit-ssh --version` to check it: a release binary prints its release version (for example `2.3.0`), while a build from source prints `<version>-dev`.
 
 ### Option B: Run with Docker
 

@@ -74,8 +74,24 @@ jobs:
         with:
           key: release-${{ matrix.pkg }}
 
-      - name: Build release binary
-        run: cargo build --release --locked --target ${{ matrix.target }}
+      # `--version` reports the tag without its leading `v`, pre-release suffix kept
+      # (v2.3.0-beta.1 -> 2.3.0-beta.1); untagged local builds report <version>-dev.
+      - name: Build release binary (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CONDUIT_RELEASE_VERSION="${GITHUB_REF_NAME#v}"
+          cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Build release binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $env:CONDUIT_RELEASE_VERSION = $env:GITHUB_REF_NAME -replace '^v', ''
+          cargo build --release --locked --target ${{ matrix.target }}
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Package archive (Unix)
         if: matrix.archive == 'tar.gz'
@@ -135,9 +151,12 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
+          # A tag with a pre-release suffix (v2.3.0-beta.1) is published as a pre-release.
+          extra=()
+          case "${TAG}" in *-*) extra=(--prerelease) ;; esac
           gh release create "${TAG}" dist/* \
             --title "rusty-conduit-ssh ${TAG}" \
-            --generate-notes
+            --generate-notes "${extra[@]}"
 
   docker:
     name: Publish Docker Image (GHCR)
