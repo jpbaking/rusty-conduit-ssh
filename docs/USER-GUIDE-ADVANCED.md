@@ -280,7 +280,7 @@ To keep that state alive, OS-level TCP keepalive is enabled on each hop that rus
 - For SSH through the proxy, also set `ServerAliveInterval` (for example `30`) in `~/.ssh/config` for that inner session. It works end to end inside the encrypted session.
 - On platforms without per-socket interval and retry control, only the idle time is applied.
 
-**Backoff.** After a drop, the delay starts at `--reconnect-initial-delay` and doubles up to `--reconnect-max-delay` (by default 1s, 2s, 4s, and so on up to 30s). It resets once a tunnel has become ready.
+**Backoff.** After a drop, the delay starts at `--reconnect-initial-delay` and doubles up to `--reconnect-max-delay` (by default 1s, 2s, 4s, and so on up to 30s). It resets once a tunnel has become ready. Each wait is randomized by ±20% so that many instances do not retry in lockstep.
 
 **What clients see:**
 

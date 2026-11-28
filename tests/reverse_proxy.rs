@@ -323,8 +323,9 @@ async fn reverse_only_mode_exits_cleanly_when_tunnel_is_lost() {
     .await;
     let proxy = listener_for(&app.specs(), 8888);
     wait_connectable(proxy).await;
-    // Let the supervisor observe readiness, so the drop is not a startup failure.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Let the supervisor observe readiness, so the drop is not a startup failure. With `-R`
+    // forwards, `ssh` must first outlive the 1 s ready grace in `src/ssh.rs`.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
 
     let pid = app.mock.wait_for_pids(1).await[0].clone();
     kill_hard(&pid);

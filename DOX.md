@@ -233,6 +233,7 @@ Run before any commit (mirrors `.github/workflows/ci.yml`; `release.yml` re-runs
 - `cargo fmt --check`
 - `cargo clippy --all-targets --locked -- -D warnings`
 - `cargo test --locked`
+- `python3 scripts/check-pure-rust-crypto.py`
 - `docker build .` when `Dockerfile` or the build layout changes.
 
 ## User Preferences
@@ -248,7 +249,7 @@ When the user requests a durable behavior change, record it here or in the relev
 - **`validate` subcommand** — loads and validates the configuration, then runs the offline pre-flight checks (MITM CA, log paths, `--error-page` template, `ssh` program, `-i` and `-F` files, `ssh -G`) unless `--settings-only`, and exits 0/1 without connecting. Startup runs the same checks before launching `ssh`. Start: `src/lib.rs` (`cmd_validate`, `preflight_checks`, `preflight_before_ssh`). Files: `src/preflight.rs`, `src/ssh.rs` (`check_ssh_setup`). Files: `src/config.rs` (`Command`), `tests/validate_cmd.rs`.
 - **Configuration** — merges CLI > env > TOML > defaults, validates, and derives engine settings (filters, MITM options, keepalive, startup summary). Start: `src/config.rs`. Files: `docs/USER-GUIDE-ADVANCED.md` (user reference).
 - **Open-file limit** — raises the soft `RLIMIT_NOFILE` at startup and logs a NOTICE when it cannot hold the forward plus reverse caps. Start: `src/fdlimit.rs`. Files: `src/lib.rs` (`fd_budget`, `run_until`), `Cargo.toml` (`rlimit`).
-- **SSH tunnel supervisor** — runs `ssh -N -T -4 -D`, probes SOCKS readiness, publishes tunnel state, reconnects with exponential backoff or stops the app under `--no-reconnect`, adds `-R` forwards. Start: `src/ssh.rs`. Files: `src/net.rs` (`TunnelState`).
+- **SSH tunnel supervisor** — runs `ssh -N -T -4 -D`, probes SOCKS readiness and reports ready only while `ssh` is still running (after a 1 s grace with `-R` forwards), publishes tunnel state, reconnects with ±20% jittered exponential backoff or stops the app under `--no-reconnect`, adds `-R` forwards; stops `ssh` with `SIGTERM` via `libc::kill` before killing it, and on Linux sets a parent-death signal (`PR_SET_PDEATHSIG`) so `ssh` cannot outlive a killed parent. Start: `src/ssh.rs`. Files: `src/net.rs` (`TunnelState`).
 - **Tunnel dialer (remote DNS)** — speaks SOCKS5 to the local `ssh -D` listener, sending hostnames unresolved; registered as the `external` `TUNNEL_PROFILE` that all forward traffic routes to. Start: `src/net.rs`. Files: `src/lib.rs` (`forward_routing`, `TUNNEL_PROFILE`).
 - **Forward proxy front end** — HTTP, HTTPS `CONNECT`, SOCKS4/4a/5, and single-port mux, provided by `rusty-conduit-engine` and wired here. Start: `src/lib.rs` (`build_engines`, `serve`). Files: `Cargo.toml` (engine pin).
 - **Reverse proxy (`ssh -R`)** — second engine server on an ephemeral loopback port, published on the SSH target, egressing directly with its own filter, MITM state, and connection cap. Start: `src/reverse.rs`. Files: `src/ssh.rs` (`ReverseForward`), `src/lib.rs`, `src/config.rs`.
@@ -258,7 +259,7 @@ When the user requests a durable behavior change, record it here or in the relev
 - **SOCKS web blocking** — `--socks-block-web` rejects HTTP/HTTPS over SOCKS. Start: `src/config.rs`. Files: `src/lib.rs` (`build_engines_with`).
 - **Logging and access logs** — six log levels, `text`/`json` access logs tagged by forward/reverse direction, no routing fields. Start: `src/lib.rs` (`access_log_config`, `log_startup`). Files: `src/config.rs`.
 - **TCP keepalive** — idle/interval/retries applied to forward and reverse client and upstream sockets. Start: `src/config.rs` (`tcp_keepalive_settings`). Files: `src/lib.rs`, `src/reverse.rs`.
-- **Packaging and release** — CI lint/test/docker build; tagged releases build six platform archives (with `CONDUIT_RELEASE_VERSION` set from the tag), SHA256SUMS, and a multi-arch GHCR image; a tag with a `-` suffix is published as a GitHub pre-release. Start: `.github/workflows/release.yml`. Files: `.github/workflows/ci.yml`, `Dockerfile`, `.dockerignore`.
+- **Packaging and release** — CI lint/test/docker build; tagged releases build six platform archives (with `CONDUIT_RELEASE_VERSION` set from the tag; the tag's `X.Y.Z` base must equal the `Cargo.toml` version (the build fails otherwise)), SHA256SUMS, and a multi-arch GHCR image; a tag with a `-` suffix is published as a GitHub pre-release. Start: `.github/workflows/release.yml`. Files: `.github/workflows/ci.yml`, `Dockerfile`, `.dockerignore`.
 - **User documentation** — marketing README with quick start, basic and advanced user guides, MITM CA guide, sizing, and Docker guide. Start: `README.md`. Files: `docs/`, `LICENSE`.
 - **Test harnesses** — unit-test helpers and the integration mock `ssh`/`ssh -D` harness. Start: `tests/common/mod.rs`. Files: `src/test_support.rs`, `tests/`.
 - **CLI family contract** — test that shared flags keep the family's names, value names, env vars, help text, and defaults. Start: `tests/cli_contract.rs`.

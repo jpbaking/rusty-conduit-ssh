@@ -48,7 +48,7 @@ On Linux, the prebuilt binaries and the container image use glibc's `malloc`, wh
 | glibc defaults, 18 CPUs | ~42 MB |
 | `MALLOC_ARENA_MAX=2`, 2 or 18 CPUs | ~7 MB |
 
-The container image sets `MALLOC_ARENA_MAX=2`. For the prebuilt Linux binaries, set it in the environment (for example `Environment=MALLOC_ARENA_MAX=2` in a `systemd` unit) to get the low figures on any CPU count. With the same engine, `rusty-conduit` and `rusty-conduit-switch` measured 110–230 KB per open tunnel without the setting and 26–27 KB with it; in a bulk-transfer test (64 parallel tunnels, 2.2–2.7 GB/s), throughput was the same either way, within run-to-run noise. Fewer worker threads also lower the idle figure: the runtime starts one per CPU it may use, so a Docker `--cpus` limit or `TOKIO_WORKER_THREADS=<n>` reduces them. The `ssh` client's own memory does not depend on this setting.
+On Linux, the binary caps glibc at two arenas itself when `MALLOC_ARENA_MAX` is not set, so the prebuilt binaries and the container image (which also sets `MALLOC_ARENA_MAX=2`) get the low figures on any CPU count. Set `MALLOC_ARENA_MAX` to another value to override it. With the same engine, `rusty-conduit` and `rusty-conduit-switch` measured 110–230 KB per open tunnel without the setting and 26–27 KB with it; in a bulk-transfer test (64 parallel tunnels, 2.2–2.7 GB/s), throughput was the same either way, within run-to-run noise. Fewer worker threads also lower the idle figure: the runtime starts one per CPU it may use, so a Docker `--cpus` limit or `TOKIO_WORKER_THREADS=<n>` reduces them. The `ssh` client's own memory does not depend on this setting.
 
 ---
 

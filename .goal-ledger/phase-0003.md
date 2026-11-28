@@ -1,56 +1,64 @@
-# phase-0003 — Raise the open-file limit at startup
+# phase-0003 — ssh child lifecycle: libc::kill, Linux parent-death signal, jittered backoff, post-ready liveness
 
 - Status: done
-- Owner: executor
-- Depends on: phase-0001
-- Goal: At startup, raise the soft open-file limit when it cannot hold the forward plus reverse connection caps, and log a NOTICE when it still cannot.
-- Done when: `cargo test --locked` passes, `diff ../rusty-conduit-switch/src/fdlimit.rs src/fdlimit.rs` prints nothing, and the `fd_budget` unit tests pass.
-- Pattern to follow: `../rusty-conduit-switch/src/fdlimit.rs` (read only: copy it verbatim) and the `fdlimit::apply` call in `../rusty-conduit-switch/src/lib.rs` right after `log_startup`
+- Owner: planner
+- Depends on: phase-0002
+- Goal: Stop `ssh` with `libc::kill` instead of spawning `/bin/kill`, make the `ssh` child die with this process on Linux, spread reconnects with ±20% jitter, and report the tunnel ready only while `ssh` is still running (after a short settle when `-R` forwards are configured).
+- Done when: every command in `## Verify` exits 0, and the planner's Linux container check (manual line in `## Verify`) passes.
+- Pattern to follow: `../rusty-conduit-gui/crates/conduit-openssh/src/orphan.rs:14-53` (`guard_command` + `set_parent_death_signal`: `PR_SET_PDEATHSIG(SIGTERM)` in `pre_exec`, then a `getppid` check that closes the race where the parent died first)
 
 ## Context
-The same `fdlimit` module ships in all three tools and must stay byte-identical; rusty-conduit-switch's goal already created it, so copy that file instead of writing a new one. Each proxied connection uses two descriptors, so the budget is `2 × connections + 64`. This tool runs up to two servers with separate caps: the forward proxy (`max_connections`, active when `cfg.forward_enabled()`) and the reverse proxy (`reverse_max_connections`, active when `cfg.reverse_enabled()`). The budget is the sum of the active caps; if any active cap is `0` (unlimited) the budget is `0`, which `fdlimit::apply` treats as "do not check".
-The `rlimit` crate raises the soft limit toward the hard limit; the copied module already avoids lowering it.
+B-03: `kill_on_drop(true)` only works while this process runs its destructors; on `SIGKILL` or the OOM killer, `ssh -N -D -R` is reparented to PID 1 and holds its remote `-R` ports, so a restarted instance fails with `ExitOnForwardFailure=yes`. Linux `PR_SET_PDEATHSIG` fires when the spawning *thread* exits. `run_attempt` spawns from a Tokio runtime worker (or the `block_on` thread), and those live as long as the runtime, so a direct `pre_exec` is enough here. The GUI needs a dedicated thread only because it spawns from the blocking pool.
+P-12: `request_terminate` (`src/ssh.rs:564-578`) forks `/bin/kill`; `libc` is already a Unix dependency. Reconnects of many instances retry in lockstep, so add ±20% jitter to the *sleep* while the backoff state (`next_delay`, `src/ssh.rs:319-321`) and its tests stay unchanged.
+B-11: the `-D` port can be answered by another local SOCKS5 server between `pick_loopback_port` and `ssh` binding it, and with `-R` the `-D` probe can pass before sshd rejects `tcpip-forward`. In both cases `ssh` exits on its own. Checking that the child is still alive (and, with `-R`, waiting a 1 s settle) before `TunnelState::Ready` stops a false "ready". `REVERSE_STABLE_UPTIME` stays as it is.
+Deferred by plan: macOS and Windows parent-death watchdogs.
+Escalation answered (user, 2026-11-28): the 1 s `REVERSE_READY_GRACE` made `tests/reverse_proxy.rs::reverse_only_mode_exits_cleanly_when_tunnel_is_lost` fail (it killed `ssh` 300 ms after the reverse proxy listened, before readiness, so `--no-reconnect` exited 1). Keep the grace; widen scope to that test and raise its sleep to 1500 ms with a comment pointing at the grace.
 
 ## Scope
-- In: `Cargo.toml`, `Cargo.lock`, `src/fdlimit.rs` (new), `src/lib.rs`
-- Out: `src/config.rs`, `src/ssh.rs`, `src/net.rs`, `src/reverse.rs`, `tests/`, `docs/`, `README.md`, `DOX.md`
+- In: `src/ssh.rs`, `DOX.md` (SSH tunnel supervisor Feature Map line only), `docs/USER-GUIDE-ADVANCED.md` (the **Backoff.** paragraph only), `tests/reverse_proxy.rs` (the readiness sleep in `reverse_only_mode_exits_cleanly_when_tunnel_is_lost` only; user-approved 2026-11-28)
+- Out: `src/lib.rs`, `src/net.rs`, `src/reverse.rs`, `Cargo.toml`, `Cargo.lock`, every other file under `tests/`
 
 ## Sub-tasks
-1. [done] Add `[target.'cfg(unix)'.dependencies]` with `rlimit = "0.12"` to `Cargo.toml` after the `[dependencies]` section and before `[dev-dependencies]`; run `cargo build` (without `--locked`) once — done when: `cargo build --locked` succeeds and `git diff --stat Cargo.lock` shows only `rlimit` (and possibly `libc`) added.
-2. [done] Copy `../rusty-conduit-switch/src/fdlimit.rs` to `src/fdlimit.rs` unchanged and add `pub mod fdlimit;` next to the other `pub mod` lines in `src/lib.rs` (near line 10) — done when: `diff ../rusty-conduit-switch/src/fdlimit.rs src/fdlimit.rs` prints nothing and `cargo test --locked --lib fdlimit` passes.
-3. [done] In `src/lib.rs` add `fn fd_budget(cfg: &Config) -> (usize, &'static str)` returning: forward and reverse both active → `(0, "--max-connections + --reverse-max-connections")` if either cap is 0, else `(cfg.max_connections + cfg.reverse_max_connections, "--max-connections + --reverse-max-connections")`; only reverse active → `(cfg.reverse_max_connections, "--reverse-max-connections")`; otherwise → `(cfg.max_connections, "--max-connections")`. Give it the doc `/// Connections the open-file limit must hold, and the flag(s) to name in the NOTICE.` — done when: `cargo build --locked` succeeds.
-4. [done] In `run_until` (`src/lib.rs:134`), on the line right after `log_startup(&cfg, &logger);`, add `let (fd_connections, fd_flag) = fd_budget(&cfg);` and `fdlimit::apply(&logger, fd_connections, fd_flag);` — done when: `cargo build --locked` succeeds.
-5. [done] Unit tests in the `mod tests` of `src/lib.rs`: build configs with `Config { ..Config::default() }` and assert `fd_budget` for (a) forward only, defaults → `(4096, "--max-connections")`; (b) forward plus reverse with `reverse_http_port: 9`, `reverse_max_connections: 10` → `(4106, "--max-connections + --reverse-max-connections")`; (c) the same with `max_connections: 0` → `(0, …)`; (d) reverse only (`http_port: 0`, `socks_port: 0`, `reverse_socks_port: 9`) → `(cfg.reverse_max_connections, "--reverse-max-connections")` — done when: `cargo test --locked --lib fd_budget` passes 4 tests.
+1. [done] Replace the `#[cfg(unix)] async fn request_terminate` (system `kill`) with a synchronous `#[cfg(unix)] fn request_terminate(child: &Child) -> bool`: `child.id()` → `libc::pid_t::try_from` → `unsafe { libc::kill(pid, libc::SIGTERM) == 0 }` with a `// SAFETY:` comment; make the `#[cfg(not(unix))]` variant synchronous too; drop the `.await` in `terminate`; update the doc comment (no longer "avoids a libc dependency") — done when: `sed -n '1,/^#\[cfg(test)\]/p' src/ssh.rs | grep -c 'Command::new("kill")'` prints `0` (the test helpers `kill_hard`/`is_alive` keep their `std::process::Command::new("kill")`) and `cargo test --locked --lib ssh::tests::process` passes (covers `shutdown_sends_sigterm_and_reaps_child` and `escalates_to_kill_when_sigterm_is_ignored`).
+2. [done] Add `#[cfg(target_os = "linux")]` parent-death guarding to the `ssh` command in `run_attempt`: build the `Command` into a `let mut command`, then apply a `guard_parent_death(&mut command)` helper that copies `orphan.rs:14-53` (record `getpid()` before spawning; in `pre_exec`, `prctl(PR_SET_PDEATHSIG, SIGTERM)` then fail with `ESRCH` if `getppid()` differs), with `// SAFETY:` comments; it is a no-op on other targets. Keep `kill_on_drop(true)` — done when: `cargo clippy --all-targets --locked -- -D warnings` and `cargo test --locked` pass on macOS, and the manual Linux check passes.
+3. [done] Add `fn jittered(delay: Duration) -> Duration` returning `delay.mul_f64(0.8 + 0.4 * frac)`, where `frac` in `[0, 1]` comes from `std::collections::hash_map::RandomState::new().hash_one(std::time::SystemTime::now())` (no new dependency). In the reconnect loop, compute `let wait = jittered(delay);` once, and use `wait` in both the `reconnecting in ...` log line and `tokio::time::sleep`. Add unit test `jitter_stays_within_twenty_percent`: 200 calls with 10 s all fall in `[8 s, 12 s]`, and they are not all equal — done when: `cargo test --locked --lib jitter` passes and `backoff_doubles_and_caps` still passes unchanged.
+4. [done] In `run_attempt`, after `wait_for_socks(addr)` wins and before `state.send_replace(TunnelState::Ready(addr))`, add a `biased` `tokio::select!` over `stop.cancelled()` (terminate, return `Attempt::Stopped`), `child.wait()` (return `dropped(exit_reason(status), false)`), and `tokio::time::sleep(settle)`, where `settle` is `Duration::ZERO` without reverse forwards and the new `const REVERSE_READY_GRACE: Duration = Duration::from_secs(1)` with them. Comment why (the reused-port and late `-R` rejection cases). Add a `process` test: a mock `ssh` that exits 0.3 s after start while the test's `socks_listener()` answers, with one reverse forward configured, never publishes `TunnelState::Ready` before the first `Disconnected`/reconnect — done when: the new test passes and `ready_only_after_socks_listener_answers` still passes.
+5. [done] Docs pass: in `DOX.md`'s **SSH tunnel supervisor** Feature Map line, mention the Linux parent-death signal, `libc::kill` `SIGTERM`, jittered backoff, and the post-ready liveness check; in `docs/USER-GUIDE-ADVANCED.md`'s **Backoff.** paragraph, add that each wait is randomized by ±20% so many instances do not retry in lockstep — done when: `grep -c 'PDEATHSIG\|parent-death' DOX.md` and `grep -c '20%' docs/USER-GUIDE-ADVANCED.md` each print at least `1`.
 
 ## Verify
 ```sh
 cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked
-diff ../rusty-conduit-switch/src/fdlimit.rs src/fdlimit.rs
-grep -n 'fdlimit::apply(&logger, fd_connections, fd_flag);' src/lib.rs
+python3 scripts/check-pure-rust-crypto.py
+test "$(sed -n '1,/^#\[cfg(test)\]/p' src/ssh.rs | grep -c 'Command::new("kill")')" = 0
+git diff --exit-code -- Cargo.toml Cargo.lock src/lib.rs src/net.rs src/reverse.rs tests ':(exclude)tests/reverse_proxy.rs'
 ```
+- manual (planner, needs Docker): `docker run --rm -v "$PWD":/src -w /src rust:1-bookworm sh -c 'apt-get update -qq && apt-get install -y -qq openssh-client >/dev/null && cargo clippy --all-targets --locked -- -D warnings && cargo test --locked'` exits 0, which compiles and runs the Linux-only path.
 
 ## Escalate when
-- `../rusty-conduit-switch/src/fdlimit.rs` does not exist → stop, set Status: needs-human — reason: the rusty-conduit-switch goal has not finished its phase-0003.
-- `Config` has no `Default` impl or `forward_enabled()` / `reverse_enabled()` behave differently from the ports-based rule above → stop, set Status: needs-human — reason: paste the relevant code.
-- `Cargo.lock` changes more than adding `rlimit` (and possibly `libc`) → stop, set Status: needs-human — reason: paste `git diff --stat Cargo.lock`.
+- Docker is unavailable for the manual Linux check → set Status: needs-human — reason: ask the user to start Docker Desktop or accept CI-only Linux verification.
+- A `process` test becomes flaky (passes and fails across 3 runs) → stop, set Status: needs-human — reason: name the test and paste both outcomes.
+- The settle step changes the timing an existing test asserts → stop, set Status: needs-human — reason: name the test.
 
 ## Log
 - (append-only, one line per event)
-- sub-task 1: added `[target.'cfg(unix)'.dependencies]` `rlimit = "0.12"` to `Cargo.toml` and updated `Cargo.lock`
-- sub-task 2: copied `../rusty-conduit-switch/src/fdlimit.rs` to `src/fdlimit.rs` unchanged and exported `pub mod fdlimit;` in `src/lib.rs`
-- sub-task 3: added `fd_budget(cfg: &Config) -> (usize, &'static str)` in `src/lib.rs`
-- sub-task 4: called `fd_budget` and `fdlimit::apply` in `run_until` right after `log_startup` in `src/lib.rs`
-- sub-task 5: added 4 `fd_budget` unit tests to `mod tests` in `src/lib.rs`
+- planner: scoped the `Command::new("kill")` check to non-test code — the test helpers at src/ssh.rs:927/935 legitimately use it, so the whole-file count could never reach 0
+- planner begins phase-0003 (solo, planner-owned)
+- sub-task 1: `request_terminate` is now synchronous and sends `SIGTERM` with `libc::kill`; `terminate` drops the `.await`
+- sub-task 2: `guard_parent_death` + `set_parent_death_signal` (copied from conduit-openssh orphan.rs) applied to the `ssh` command on Linux; no-op elsewhere; `kill_on_drop(true)` kept
+- sub-task 3: `jittered()` with `RECONNECT_JITTER = 0.2`; reconnect log and sleep both use the jittered wait (log rounded to ms); `next_delay` unchanged
+- sub-task 4: `REVERSE_READY_GRACE = 1s` settle select before `TunnelState::Ready`; new test `reverse_tunnel_that_exits_within_grace_is_never_ready` (mock gains `with_body`)
+- escalation hit: settle broke `reverse_only_mode_exits_cleanly_when_tunnel_is_lost` (exit 1 vs 0) on macOS and Linux; asked the user; answer recorded in Context; fixed the test's sleep (300 → 1500 ms)
+- sub-task 5: DOX Feature Map line and USER-GUIDE-ADVANCED Backoff paragraph updated
+- phase-0003 verified and closed (macOS and Linux)
 
 ## Evidence
 - (append-only: command → observed result)
-- `cargo build && cargo build --locked && git diff --stat Cargo.lock` → exit 0; `Cargo.lock | 10 ++++++++++` (only `rlimit 0.12.0` added)
-- `diff ../rusty-conduit-switch/src/fdlimit.rs src/fdlimit.rs` → exit 0 (no diff); `cargo test --locked --lib fdlimit` → exit 0 (4 passed, 0 failed)
-- `cargo build --locked` (after sub-task 3) → exit 0
-- `cargo build --locked` (after sub-task 4) → exit 0 (no warnings)
-- `cargo test --locked --lib fd_budget` → exit 0 (4 passed, 0 failed)
-- `cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings && cargo test --locked` → exit 0 (153 passed: 102 unit + 51 integration, 0 failed)
-- `diff ../rusty-conduit-switch/src/fdlimit.rs src/fdlimit.rs` → exit 0 (no diff)
-- `grep -n 'fdlimit::apply(&logger, fd_connections, fd_flag);' src/lib.rs` → `156:    fdlimit::apply(&logger, fd_connections, fd_flag);`
+- `cargo test --locked --lib jitter` → 1 passed; `cargo test --locked --lib backoff_doubles_and_caps` → 1 passed (unchanged)
+- `cargo test --locked --lib ssh::tests::process` ×3 → 10 passed each run (incl. new `reverse_tunnel_that_exits_within_grace_is_never_ready`, `ready_only_after_socks_listener_answers`, `shutdown_sends_sigterm_and_reaps_child`, `escalates_to_kill_when_sigterm_is_ignored`)
+- first Linux run: `reverse_only_mode_exits_cleanly_when_tunnel_is_lost` FAILED (ExitCode 1 vs 0), reproduced on macOS → escalated; after the approved test fix `cargo test --locked --test reverse_proxy` ×3 → 11 passed each
+- `cargo fmt --check` → exit 0; `cargo clippy --all-targets --locked -- -D warnings` → exit 0; `cargo test --locked` → 185 passed, 0 failed; `python3 scripts/check-pure-rust-crypto.py` → PURE_RUST_CRYPTO_OK
+- non-test `Command::new("kill")` count → 0; `git diff --exit-code -- Cargo.toml Cargo.lock src/lib.rs src/net.rs src/reverse.rs tests ':(exclude)tests/reverse_proxy.rs'` → exit 0
+- `grep -c 'PDEATHSIG\|parent-death' DOX.md` → 1; `grep -c '20%' docs/USER-GUIDE-ADVANCED.md` → 1
+- manual Linux: rust:1-bookworm + openssh-client + clippy: `cargo clippy --all-targets --locked -- -D warnings && cargo test --locked` → exit 0, 185 passed, 0 failed

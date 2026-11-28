@@ -5,12 +5,14 @@
 //! With `--no-reconnect` it instead cancels the application shutdown token when the tunnel
 //! drops. Stdin and stderr are inherited by default so interactive SSH auth keeps working.
 
+use std::collections::hash_map::RandomState;
 use std::fmt;
+use std::hash::BuildHasher;
 use std::io;
 use std::net::{IpAddr, SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -32,6 +34,12 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 /// With `-R`, the `-D` probe can pass before sshd has answered the remote bind request, so a
 /// tunnel must stay up this long before a drop resets the reconnect backoff.
 const REVERSE_STABLE_UPTIME: Duration = Duration::from_secs(5);
+/// With `-R`, sshd can reject `tcpip-forward` just after the `-D` probe passes, so `ssh` must
+/// stay alive this long before the tunnel is reported ready.
+const REVERSE_READY_GRACE: Duration = Duration::from_secs(1);
+/// Reconnect waits are spread by this fraction either way, so many instances do not retry in
+/// lockstep.
+const RECONNECT_JITTER: f64 = 0.2;
 
 /// One `ssh -R` forward: `remote` is bound on the SSH target and connects back to `local`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -320,6 +328,14 @@ fn next_delay(current: Duration, max: Duration) -> Duration {
     current.saturating_mul(2).min(max)
 }
 
+/// `delay` scaled by a random factor in `[1 - RECONNECT_JITTER, 1 + RECONNECT_JITTER]`. Each
+/// `RandomState` is freshly keyed, which is random enough to de-synchronize retries.
+fn jittered(delay: Duration) -> Duration {
+    let hash = RandomState::new().hash_one(SystemTime::now());
+    let frac = hash as f64 / u64::MAX as f64;
+    delay.mul_f64(1.0 - RECONNECT_JITTER + 2.0 * RECONNECT_JITTER * frac)
+}
+
 /// Whether a drop after `uptime` should reset the backoff. A rejected `-R` bind exits `ssh`
 /// just after the `-D` probe passes, and must not retry at the initial delay forever.
 fn resets_backoff(cfg: &SshTunnelConfig, uptime: Duration) -> bool {
@@ -426,13 +442,14 @@ async fn supervise(
         if was_ready {
             delay = cfg.reconnect_initial_delay;
         }
+        let wait = jittered(delay);
         logger.error(format!(
             "SSH tunnel down: {reason}; reconnecting in {}",
-            humantime::format_duration(delay)
+            humantime::format_duration(Duration::from_millis(wait.as_millis() as u64))
         ));
         tokio::select! {
             () = stop.cancelled() => break,
-            () = tokio::time::sleep(delay) => {}
+            () = tokio::time::sleep(wait) => {}
         }
         delay = next_delay(delay, cfg.reconnect_max_delay);
     }
@@ -464,14 +481,15 @@ async fn run_attempt(
             Stdio::null()
         }
     };
-    let mut child = match Command::new(&cfg.ssh_bin)
+    let mut command = Command::new(&cfg.ssh_bin);
+    command
         .args(build_ssh_args(cfg, addr))
         .stdin(stdio(cfg.inherit_stdio))
         .stdout(Stdio::null())
         .stderr(stdio(cfg.inherit_stdio))
-        .kill_on_drop(true)
-        .spawn()
-    {
+        .kill_on_drop(true);
+    guard_parent_death(&mut command);
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {
             return dropped(
@@ -500,6 +518,24 @@ async fn run_attempt(
             );
         }
         () = wait_for_socks(addr) => {}
+    }
+
+    // The probe can be answered by another local SOCKS server that took the port before
+    // `ssh` bound it, and with `-R` it can pass before sshd rejects the remote bind. `ssh`
+    // exits on its own in both cases, so only report ready while it is still running.
+    let settle = if cfg.reverse_forwards.is_empty() {
+        Duration::ZERO
+    } else {
+        REVERSE_READY_GRACE
+    };
+    tokio::select! {
+        biased;
+        () = stop.cancelled() => {
+            terminate(&mut child).await;
+            return Attempt::Stopped;
+        }
+        status = child.wait() => return dropped(exit_reason(status), false),
+        () = tokio::time::sleep(settle) => {}
     }
 
     state.send_replace(TunnelState::Ready(addr));
@@ -549,7 +585,7 @@ async fn probe_socks5(addr: SocketAddr) -> bool {
 
 /// Stop `ssh`: `SIGTERM` first on Unix so it can restore the terminal, then kill.
 async fn terminate(child: &mut Child) {
-    if request_terminate(child).await
+    if request_terminate(child)
         && tokio::time::timeout(TERMINATE_GRACE, child.wait())
             .await
             .is_ok()
@@ -559,27 +595,52 @@ async fn terminate(child: &mut Child) {
     let _ = child.kill().await;
 }
 
-/// Send `SIGTERM` using the system `kill`, which avoids a libc dependency. The child has not
-/// been reaped while we hold it, so its PID cannot have been reused.
+/// Send `SIGTERM`. The child has not been reaped while we hold it, so its PID cannot have
+/// been reused.
 #[cfg(unix)]
-async fn request_terminate(child: &Child) -> bool {
-    let Some(pid) = child.id() else {
+fn request_terminate(child: &Child) -> bool {
+    let Some(pid) = child.id().and_then(|id| libc::pid_t::try_from(id).ok()) else {
         return false;
     };
-    Command::new("kill")
-        .arg("-TERM")
-        .arg(pid.to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await
-        .is_ok_and(|status| status.success())
+    // SAFETY: `kill` takes integer arguments and touches no memory.
+    unsafe { libc::kill(pid, libc::SIGTERM) == 0 }
 }
 
 #[cfg(not(unix))]
-async fn request_terminate(_child: &Child) -> bool {
+fn request_terminate(_child: &Child) -> bool {
     false
+}
+
+/// On Linux, `ssh` gets `SIGTERM` when the thread that spawned it exits, so it cannot outlive
+/// a `SIGKILL`ed or OOM-killed parent and keep holding its `-R` ports. The spawning thread is
+/// a runtime worker (or the `block_on` thread), which lives as long as the runtime.
+/// `kill_on_drop` still covers orderly exits on every platform.
+#[cfg(target_os = "linux")]
+fn guard_parent_death(command: &mut Command) {
+    // SAFETY: `getpid` has no preconditions.
+    let parent = unsafe { libc::getpid() };
+    // SAFETY: the closure only makes async-signal-safe calls and does not allocate.
+    unsafe {
+        command.pre_exec(move || set_parent_death_signal(parent));
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn guard_parent_death(_command: &mut Command) {}
+
+/// The check after `prctl` closes the race where the parent died just before it.
+#[cfg(target_os = "linux")]
+fn set_parent_death_signal(expected_parent: libc::pid_t) -> io::Result<()> {
+    let signal = libc::SIGTERM as libc::c_ulong;
+    // SAFETY: `PR_SET_PDEATHSIG` takes integer arguments and touches no memory.
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, signal, 0, 0, 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `getppid` has no preconditions.
+    if unsafe { libc::getppid() } != expected_parent {
+        return Err(io::Error::from_raw_os_error(libc::ESRCH));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -792,6 +853,16 @@ mod tests {
     }
 
     #[test]
+    fn jitter_stays_within_twenty_percent() {
+        let base = Duration::from_secs(10);
+        let waits: Vec<_> = (0..200).map(|_| jittered(base)).collect();
+        assert!(waits
+            .iter()
+            .all(|w| (Duration::from_secs(8)..=Duration::from_secs(12)).contains(w)));
+        assert!(waits.iter().any(|w| *w != waits[0]), "jitter never varied");
+    }
+
+    #[test]
     fn picks_a_bindable_port() {
         let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let port = pick_loopback_port(ip).unwrap();
@@ -818,6 +889,10 @@ mod tests {
 
         impl MockSsh {
             fn new(term_handler: &str) -> Self {
+                Self::with_body(term_handler, "while :; do sleep 0.05; done")
+            }
+
+            fn with_body(term_handler: &str, body: &str) -> Self {
                 let dir = std::env::temp_dir().join(format!(
                     "rcs-mock-ssh-{}-{}",
                     std::process::id(),
@@ -831,7 +906,7 @@ mod tests {
                      trap '{term_handler}' TERM\n\
                      printf '%s\\n' \"$@\" > '{d}/args'\n\
                      echo \"$$\" >> '{d}/pids'\n\
-                     while :; do sleep 0.05; done\n"
+                     {body}\n"
                 );
                 let bin = dir.join("ssh");
                 fs::write(&bin, script).unwrap();
@@ -980,6 +1055,28 @@ mod tests {
 
             let args = mock.lines("args");
             assert_eq!(&args[args.len() - 2..], ["--", "user@host"]);
+            handle.shutdown().await;
+            server.abort();
+        }
+
+        #[tokio::test]
+        async fn reverse_tunnel_that_exits_within_grace_is_never_ready() {
+            // Stands in for sshd rejecting `tcpip-forward` after the `-D` probe passed.
+            let mock = MockSsh::with_body("", "sleep 0.3; exit 255");
+            let (port, server) = socks_listener().await;
+            let mut cfg = mock.config(port);
+            cfg.reverse_forwards = vec![ReverseForward {
+                remote: addr(18080),
+                local: addr(8080),
+            }];
+            let (handle, _rx) = SshSupervisor::spawn(cfg, logger(), CancellationToken::new());
+
+            let window = Duration::from_millis(1500);
+            assert_eq!(
+                handle.wait_ready(window).await,
+                Err(SshError::StartupTimeout(window))
+            );
+            assert!(mock.lines("pids").len() >= 2, "ssh was not restarted");
             handle.shutdown().await;
             server.abort();
         }
